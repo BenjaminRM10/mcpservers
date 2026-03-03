@@ -1,6 +1,7 @@
 import os
 import shutil
 import httpx
+import subprocess
 from pathlib import Path
 from typing import Optional, Literal
 from mcp.server.fastmcp import FastMCP, Context
@@ -111,8 +112,17 @@ async def consult_multimedia_options(
     DO NOT call generate tools until the user has explicitly confirmed their choices.
     DO NOT assume defaults — ask the user for EVERY creative decision.
     """
+    global_rule = """
+=== GLOBAL CRITICAL RULE (ALL MEDIA TYPES) ===
+The user does NOT have to generate every asset with AI.
+Always ask first: "Do you want to generate assets from scratch, or use your own existing local files?"
+You can accept absolute local file paths (e.g., /home/user/video.mp4 or /home/user/voice.m4a)
+and pass them directly into tools like merge_audio_video or create_talking_avatar.
+"""
+
     if media_type == "image":
-        return """
+        return f"""
+{global_rule}
 === IMAGE GENERATION OPTIONS ===
 
 ENGINES (ask the user which one):
@@ -139,7 +149,8 @@ QUESTIONS YOU MUST ASK THE USER:
 OUTPUT: Saves to current working directory AND backup copy to ~/Documents/ai-multimedia-files/
 """
     elif media_type == "video":
-        return """
+        return f"""
+{global_rule}
 === VIDEO GENERATION OPTIONS ===
 
 ENGINES (ask the user which one):
@@ -152,8 +163,24 @@ ENGINES (ask the user which one):
    Price: $0.28/6sec or $0.56/10sec | Best for: Great motion physics, camera control
    Supports: Camera movements in prompt: [Pan left], [Zoom in], [Tracking shot], [Tilt up], etc.
 
+COST STRATEGY DECISION TREE (for "video with sound"):
+A) Talking Head Scenario (~$0.15)
+   - Person talking to camera.
+   - DO NOT use regular video generation.
+   - Use Avatar workflow: Image -> TTS -> create_talking_avatar.
+
+B) Cinematic/B-Roll Scenario (~$0.30)
+   - General scene + voiceover/music.
+   - Generate mute video with generate_video(generate_audio=False),
+     generate audio separately with generate_audio, then merge with merge_audio_video.
+
+C) Complex Physics/Lip-sync (~$1.30+)
+   - Exact physical sync or complex interaction requiring native model audio alignment.
+   - Use Kling with generate_audio=True.
+   - MUST warn user this path is significantly more expensive before generation.
+
 QUESTIONS YOU MUST ASK THE USER:
-- Text-to-Video or Image-to-Video? (If i2v, they need an image PUBLIC_URL)
+- Text-to-Video or Image-to-Video? (If i2v, they need an image PUBLIC_URL or local path)
 - Which engine? Explain the price/quality differences.
 - Duration: 5, 10, or 15 seconds (Kling only)? (videos are expensive — confirm budget)
 - Aspect ratio: 16:9 (landscape), 9:16 (vertical/mobile), 1:1 (square)?
@@ -162,9 +189,11 @@ QUESTIONS YOU MUST ASK THE USER:
 - For Hailuo: Any camera movements? ([Pan left], [Zoom in], [Pull out], [Static shot], etc.)
 - Confirm total estimated cost before generating.
 - IMPORTANT: You must call generate_video once with confirm_cost=false first, show the estimate to the user, and only proceed after explicit user confirmation.
+- If the plan involves merging audio and video, explicitly ask: "Do you want the video to loop if the audio is longer, or should I cut the final file to the shortest media?" Pass their choice to loop_video.
 """
     elif media_type == "audio":
-        return """
+        return f"""
+{global_rule}
 === AUDIO GENERATION OPTIONS ===
 
 TYPE 1: "tts" — Text-to-Speech (ElevenLabs Multilingual v2)
@@ -206,7 +235,8 @@ QUESTIONS YOU MUST ASK THE USER:
 - For Music: What genre? Instrumental or vocals? How long?
 """
     elif media_type == "avatar":
-        return """
+        return f"""
+{global_rule}
 === TALKING AVATAR OPTIONS ===
 
 ENGINES (ask the user which one):
@@ -255,6 +285,74 @@ async def upload_file(
         return f"Successfully uploaded.\nLOCAL_PATH: {local_path}\nPUBLIC_URL: {url}"
     except Exception as e:
         return f"Failed to upload file: {str(e)}"
+
+
+# =============================================================================
+# LOCAL MERGE TOOL (FFMPEG)
+# =============================================================================
+
+@mcp.tool()
+async def merge_audio_video(
+    video_path: str,
+    audio_path: str,
+    output_filename: str,
+    loop_video: bool = False,
+    ctx: Context = None
+) -> str:
+    """
+    Merges a local video file and a local audio file using local FFmpeg.
+
+    Requirements:
+    - video_path and audio_path must be local existing files.
+    - If loop_video is True, video is looped infinitely, and final output is cut by -shortest.
+
+    FFmpeg behavior:
+    - Uses `-c:v copy` and `-c:a aac`
+    - Uses `-shortest` to stop at the shortest active stream.
+    """
+    try:
+        check_fal_key()
+
+        # Resolve using existing path helper as requested
+        resolved_video_path = resolve_output_path(video_path)
+        resolved_audio_path = resolve_output_path(audio_path)
+        output_path = resolve_output_path(output_filename)
+
+        if not resolved_video_path.exists():
+            return f"Error: video file not found at {resolved_video_path}"
+        if not resolved_audio_path.exists():
+            return f"Error: audio file not found at {resolved_audio_path}"
+
+        ffmpeg_cmd = ["ffmpeg", "-y"]
+        if loop_video:
+            ffmpeg_cmd.extend(["-stream_loop", "-1"])
+
+        ffmpeg_cmd.extend([
+            "-i", str(resolved_video_path),
+            "-i", str(resolved_audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            str(output_path),
+        ])
+
+        if ctx:
+            await ctx.info("Merging local video+audio with FFmpeg...")
+
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+
+        if ctx:
+            await ctx.info("Uploading merged output to Fal storage...")
+
+        public_url = await fal_client.upload_file_async(str(output_path))
+        archive = copy_to_archive(output_path)
+        return format_result("merged media", "ffmpeg", str(output_path), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed to merge with ffmpeg: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed to merge audio+video: {str(e)}"
 
 
 # =============================================================================
