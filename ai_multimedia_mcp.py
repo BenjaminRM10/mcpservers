@@ -227,9 +227,14 @@ PICTURE-IN-PICTURE (PiP):
 If the user wants to overlay a talking avatar or a camera feed onto a background video
 (like a screen recording), use the create_pip_video tool to combine two local videos.
 
-TRADITIONAL NLE EDITING (LOCAL FFMPEG):
-You also have local non-linear editing tools: trim_media, concatenate_media, extract_audio.
-Chain them with AI generation tools for advanced workflows.
+LOCAL FFMPEG & EDITING:
+You have local non-linear editing tools: trim_media, concatenate_media, extract_audio,
+merge_audio_video, create_pip_video, and execute_raw_ffmpeg.
+- create_pip_video supports BOTH video and static image backgrounds.
+- For complex editing (speed ramps, chroma key/green screen, complex audio mixing,
+  color correction) that standard tools cannot handle, formulate exact FFmpeg args
+  and use execute_raw_ffmpeg.
+Chain these tools with AI generation tools for advanced workflows.
 Example: If user wants AI music only on a 10-second portion of a local video,
 first trim_media that portion, then generate_audio, then merge_audio_video,
 and finally concatenate_media clips back if needed.
@@ -477,54 +482,34 @@ async def merge_audio_video(
 
 @mcp.tool()
 async def create_pip_video(
-    main_video_path: str,
+    main_media_path: str,
     overlay_video_path: str,
     output_filename: str,
     position: Literal["bottom-right", "bottom-left", "top-right", "top-left"] = "bottom-right",
     ctx: Context = None,
 ) -> str:
     """
-    Creates a Picture-in-Picture (PiP) video from two local videos.
+    Creates Picture-in-Picture (PiP) output from a main media + overlay video.
 
-    - Scales overlay video to 25% of main video width.
-    - Places overlay with 20px padding according to `position`.
-    - Preserves overlay audio at minimum; mixes main+overlay audio when possible.
-    - Uses -shortest in final output.
+    - main_media_path can be a video OR static image (.jpg/.jpeg/.png/.webp).
+    - Overlay video is scaled to 25% of main media width.
+    - Overlay is placed with 20px padding based on position.
+    - Overlay filter includes shortest=1 to avoid infinite loop hangs when image looping is used.
+    - Preserves overlay audio in output via -map 1:a?.
     """
     try:
         check_fal_key()
 
-        resolved_main = resolve_output_path(main_video_path)
+        resolved_main = resolve_output_path(main_media_path)
         resolved_overlay = resolve_output_path(overlay_video_path)
         output_path = resolve_output_path(output_filename)
 
         if not resolved_main.exists():
-            return f"Error: main video file not found at {resolved_main}"
+            return f"Error: main media file not found at {resolved_main}"
         if not resolved_overlay.exists():
             return f"Error: overlay video file not found at {resolved_overlay}"
 
-        if ctx:
-            await ctx.info("Building PiP video with local FFmpeg...")
-
-        # Detect if main video has audio, so we can mix when possible.
-        has_main_audio = False
-        try:
-            probe = subprocess.run(
-                [
-                    "ffprobe", "-v", "error",
-                    "-select_streams", "a",
-                    "-show_entries", "stream=index",
-                    "-of", "json",
-                    str(resolved_main),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            data = json.loads(probe.stdout or "{}")
-            has_main_audio = bool(data.get("streams"))
-        except Exception:
-            has_main_audio = False
+        is_image_main = resolved_main.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
 
         position_map = {
             "bottom-right": "W-w-20:H-h-20",
@@ -534,32 +519,29 @@ async def create_pip_video(
         }
         overlay_xy = position_map.get(position, "W-w-20:H-h-20")
 
-        if has_main_audio:
-            filter_complex = (
-                f"[1:v][0:v]scale2ref=w=iw*0.25:h=ow/mdar[ovr][base];"
-                f"[base][ovr]overlay={overlay_xy}[vout];"
-                f"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-            )
-            map_args = ["-map", "[vout]", "-map", "[aout]"]
-        else:
-            filter_complex = (
-                f"[1:v][0:v]scale2ref=w=iw*0.25:h=ow/mdar[ovr][base];"
-                f"[base][ovr]overlay={overlay_xy}[vout]"
-            )
-            # At minimum preserve overlay audio
-            map_args = ["-map", "[vout]", "-map", "1:a?"]
+        # CRITICAL: shortest=1 inside overlay filter to prevent infinite processing with -loop 1 image backgrounds.
+        filter_complex = (
+            f"[1:v][0:v]scale2ref=w=iw*0.25:h=ow/mdar[ovrl][base];"
+            f"[base][ovrl]overlay={overlay_xy}:shortest=1[vout]"
+        )
 
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
+        ffmpeg_cmd = ["ffmpeg", "-y"]
+        if is_image_main:
+            ffmpeg_cmd.extend(["-loop", "1"])
+        ffmpeg_cmd.extend([
             "-i", str(resolved_main),
             "-i", str(resolved_overlay),
             "-filter_complex", filter_complex,
-            *map_args,
+            "-map", "[vout]",
+            "-map", "1:a?",
             "-c:v", "libx264",
             "-c:a", "aac",
             "-shortest",
             str(output_path),
-        ]
+        ])
+
+        if ctx:
+            await ctx.info("Creating PiP video with local FFmpeg...")
 
         subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
 
@@ -720,6 +702,58 @@ async def extract_audio(
         return f"Failed to extract audio with ffmpeg: {stderr or str(e)}"
     except Exception as e:
         return f"Failed to extract audio: {str(e)}"
+
+
+@mcp.tool()
+async def execute_raw_ffmpeg(
+    input_paths: list[str],
+    custom_ffmpeg_args: list[str],
+    output_filename: str,
+    ctx: Context = None,
+) -> str:
+    """
+    God-mode local FFmpeg execution for advanced editing.
+
+    Command shape:
+      ffmpeg -y (-i <input1> -i <input2> ...) <custom_ffmpeg_args...> <output>
+
+    Notes:
+    - custom_ffmpeg_args should NOT include input/output paths.
+    - Useful for complex workflows (speed ramps, chroma key, complex audio mixing, color correction).
+    """
+    try:
+        check_fal_key()
+
+        if not input_paths:
+            return "Error: input_paths cannot be empty."
+
+        resolved_inputs = [resolve_output_path(p) for p in input_paths]
+        for p in resolved_inputs:
+            if not p.exists():
+                return f"Error: input file not found at {p}"
+
+        output_path = resolve_output_path(output_filename)
+
+        cmd = ["ffmpeg", "-y"]
+        for p in resolved_inputs:
+            cmd.extend(["-i", str(p)])
+        cmd.extend(custom_ffmpeg_args)
+        cmd.append(str(output_path))
+
+        if ctx:
+            await ctx.info("Executing raw FFmpeg command...")
+
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        public_url = await fal_client.upload_file_async(str(output_path))
+        archive = copy_to_archive(output_path)
+        return format_result("raw ffmpeg output", "ffmpeg", str(output_path), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed raw ffmpeg execution: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed raw ffmpeg execution: {str(e)}"
 
 
 # =============================================================================
