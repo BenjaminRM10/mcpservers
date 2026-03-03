@@ -106,6 +106,52 @@ def format_result(media_type: str, engine: str, local_path: str, public_url: str
     return "\n".join(lines)
 
 
+def _fmt_ts(seconds: float, vtt: bool = False) -> str:
+    seconds = max(0.0, float(seconds or 0.0))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms == 1000:
+        s += 1
+        ms = 0
+    if s == 60:
+        m += 1
+        s = 0
+    if m == 60:
+        h += 1
+        m = 0
+    if vtt:
+        return f"{h:02}:{m:02}:{s:02}.{ms:03}"
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+def _segments_to_srt(segments: list[dict]) -> str:
+    lines = []
+    for i, seg in enumerate(segments, start=1):
+        start = seg.get("start", 0)
+        end = seg.get("end", start + 2)
+        text = (seg.get("text") or "").strip() or "..."
+        lines.append(str(i))
+        lines.append(f"{_fmt_ts(start)} --> {_fmt_ts(end)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _segments_to_vtt(segments: list[dict]) -> str:
+    lines = ["WEBVTT", ""]
+    for i, seg in enumerate(segments, start=1):
+        start = seg.get("start", 0)
+        end = seg.get("end", start + 2)
+        text = (seg.get("text") or "").strip() or "..."
+        lines.append(str(i))
+        lines.append(f"{_fmt_ts(start, vtt=True)} --> {_fmt_ts(end, vtt=True)}")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
 # =============================================================================
 # FAL DOCS BRIDGE (embedded docs consultation)
 # =============================================================================
@@ -253,6 +299,70 @@ async def search_multimedia_tech(
         return f"Failed technical search via Tavily: {str(e)}"
 
 
+@mcp.tool()
+async def generate_subtitles_file(
+    audio_or_video_url: str,
+    format: Literal["srt", "vtt", "json"] = "srt",
+    output_filename: str = "subtitles.srt",
+    ctx: Context = None,
+) -> str:
+    """
+    Generates subtitle file (SRT/VTT/JSON) from audio or video using Whisper on Fal.ai.
+    Accepts public URL or local path (auto-uploaded).
+    """
+    try:
+        check_fal_key()
+        media_url = await ensure_public_url(audio_or_video_url)
+        output_path = resolve_output_path(output_filename)
+
+        if ctx:
+            await ctx.info("Transcribing media with Whisper...")
+
+        # Try known Whisper endpoints (best-effort compatibility)
+        last_err = None
+        result = None
+        candidates = ["fal-ai/whisper", "fal-ai/whisper-large-v3"]
+        for model in candidates:
+            try:
+                result = await fal_client.subscribe_async(
+                    model,
+                    arguments={"audio_url": media_url, "task": "transcribe"},
+                    with_logs=True,
+                    client_timeout=900.0,
+                )
+                if result:
+                    break
+            except Exception as e:
+                last_err = e
+                result = None
+
+        if result is None:
+            raise RuntimeError(f"Whisper request failed: {last_err}")
+
+        segments = result.get("segments") or result.get("chunks") or []
+        if not segments and result.get("text"):
+            # fallback single segment if timestamps unavailable
+            segments = [{"start": 0.0, "end": 5.0, "text": result.get("text", "")}]
+
+        fmt = format.lower()
+        if fmt == "json":
+            output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        elif fmt == "vtt":
+            output_path.write_text(_segments_to_vtt(segments), encoding="utf-8")
+        else:
+            output_path.write_text(_segments_to_srt(segments), encoding="utf-8")
+
+        return (
+            "SUBTITLES_GENERATED\n"
+            f"FORMAT: {fmt}\n"
+            f"LOCAL_PATH: {output_path}\n"
+            "Use LOCAL_PATH with execute_raw_ffmpeg subtitles filter for burned-in captions."
+        )
+
+    except Exception as e:
+        return f"Failed to generate subtitles file: {str(e)}"
+
+
 # =============================================================================
 # CONSULTATION TOOL — Must be called first to discuss options with the user
 # =============================================================================
@@ -304,6 +414,18 @@ Chain these tools with AI generation tools for advanced workflows.
 Example: If user wants AI music only on a 10-second portion of a local video,
 first trim_media that portion, then generate_audio, then merge_audio_video,
 and finally concatenate_media clips back if needed.
+
+🎬 VIRAL SHORT CLONE WORKFLOW (THE OPUSCLIP STRATEGY):
+When user says "make this video viral", follow this sequence:
+1) Transcribe: call generate_subtitles_file to get text + timing.
+2) Analyze & Script: identify hooks (first 3s) and emphasis keywords.
+3) B-roll injection: generate_image/generate_video and overlay via create_pip_video or execute_raw_ffmpeg.
+4) Punch-ins (zooms): use execute_raw_ffmpeg with crop/zoom logic to reset attention.
+5) Subtitles: burn SRT with execute_raw_ffmpeg subtitles filter, optionally TikTok style
+   (yellow font, strong black outline/border style).
+6) Background music: generate_audio(engine="music") + merge_audio_video,
+   and if needed use execute_raw_ffmpeg to lower music gain near ~10% under speech.
+7) Optional SFX: add special effects for emphasis moments.
 """
 
     if media_type == "image":
