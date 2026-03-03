@@ -126,17 +126,51 @@ def _fmt_ts(seconds: float, vtt: bool = False) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
-def _split_caption_chunks(text: str, max_words: int = 5) -> list[str]:
+def _split_caption_chunks(text: str, min_words: int = 2, max_words: int = 5) -> list[str]:
     words = (text or "").strip().split()
     if not words:
         return ["..."]
+
+    # Respect punctuation boundaries first when possible
+    punct_chunks = []
+    bucket = []
+    for w in words:
+        bucket.append(w)
+        if any(w.endswith(p) for p in [".", ",", "!", "?", ";", ":"]) and len(bucket) >= min_words:
+            punct_chunks.append(bucket)
+            bucket = []
+    if bucket:
+        punct_chunks.append(bucket)
+
     chunks = []
-    for i in range(0, len(words), max_words):
-        chunks.append(" ".join(words[i:i + max_words]))
+    for group in punct_chunks:
+        i = 0
+        n = len(group)
+        while i < n:
+            remaining = n - i
+            take = min(max_words, remaining)
+            # avoid trailing 1-word chunk
+            if remaining - take == 1 and take > min_words:
+                take -= 1
+            chunks.append(" ".join(group[i:i + take]))
+            i += take
+
+    # final guard: never empty, and avoid 1-word captions when possible
+    if len(chunks) >= 2:
+        normalized = []
+        carry = None
+        for c in chunks:
+            wc = c.split()
+            if len(wc) == 1 and normalized:
+                normalized[-1] = normalized[-1] + " " + c
+            else:
+                normalized.append(c)
+        chunks = normalized
+
     return chunks
 
 
-def _segments_to_srt(segments: list[dict], max_words_per_caption: int = 5) -> str:
+def _segments_to_srt(segments: list[dict], min_words_per_caption: int = 2, max_words_per_caption: int = 5) -> str:
     lines = []
     idx = 1
     for seg in segments:
@@ -145,7 +179,7 @@ def _segments_to_srt(segments: list[dict], max_words_per_caption: int = 5) -> st
         if end <= start:
             end = start + 1.2
         text = (seg.get("text") or "").strip() or "..."
-        chunks = _split_caption_chunks(text, max_words=max_words_per_caption)
+        chunks = _split_caption_chunks(text, min_words=min_words_per_caption, max_words=max_words_per_caption)
         total = max(1, len(chunks))
         dur = max(0.8, (end - start) / total)
         t0 = start
@@ -160,7 +194,7 @@ def _segments_to_srt(segments: list[dict], max_words_per_caption: int = 5) -> st
     return "\n".join(lines).strip() + "\n"
 
 
-def _segments_to_vtt(segments: list[dict], max_words_per_caption: int = 5) -> str:
+def _segments_to_vtt(segments: list[dict], min_words_per_caption: int = 2, max_words_per_caption: int = 5) -> str:
     lines = ["WEBVTT", ""]
     idx = 1
     for seg in segments:
@@ -169,7 +203,7 @@ def _segments_to_vtt(segments: list[dict], max_words_per_caption: int = 5) -> st
         if end <= start:
             end = start + 1.2
         text = (seg.get("text") or "").strip() or "..."
-        chunks = _split_caption_chunks(text, max_words=max_words_per_caption)
+        chunks = _split_caption_chunks(text, min_words=min_words_per_caption, max_words=max_words_per_caption)
         total = max(1, len(chunks))
         dur = max(0.8, (end - start) / total)
         t0 = start
@@ -336,6 +370,7 @@ async def generate_subtitles_file(
     audio_or_video_url: str,
     format: Literal["srt", "vtt", "json"] = "srt",
     output_filename: str = "subtitles.srt",
+    min_words_per_caption: int = 2,
     max_words_per_caption: int = 5,
     ctx: Context = None,
 ) -> str:
@@ -381,9 +416,23 @@ async def generate_subtitles_file(
         if fmt == "json":
             output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         elif fmt == "vtt":
-            output_path.write_text(_segments_to_vtt(segments, max_words_per_caption=max_words_per_caption), encoding="utf-8")
+            output_path.write_text(
+                _segments_to_vtt(
+                    segments,
+                    min_words_per_caption=min_words_per_caption,
+                    max_words_per_caption=max_words_per_caption,
+                ),
+                encoding="utf-8",
+            )
         else:
-            output_path.write_text(_segments_to_srt(segments, max_words_per_caption=max_words_per_caption), encoding="utf-8")
+            output_path.write_text(
+                _segments_to_srt(
+                    segments,
+                    min_words_per_caption=min_words_per_caption,
+                    max_words_per_caption=max_words_per_caption,
+                ),
+                encoding="utf-8",
+            )
 
         return (
             "SUBTITLES_GENERATED\n"
@@ -394,6 +443,90 @@ async def generate_subtitles_file(
 
     except Exception as e:
         return f"Failed to generate subtitles file: {str(e)}"
+
+
+@mcp.tool()
+async def burn_subtitles_pro(
+    video_path: str,
+    subtitles_path: str,
+    output_filename: str,
+    style_preset: Literal["tiktok", "mrbeast", "clean"] = "mrbeast",
+    primary_color_bgr: str = "&H00FFFF",
+    margin_v: int = 100,
+    font_size: int = 18,
+    ctx: Context = None,
+) -> str:
+    """
+    Burns subtitles with better social styles (Opus/Submagic-like readability).
+
+    - Accepts local video + local subtitle file (.srt/.ass/.vtt)
+    - Allows color and vertical offset customization
+    - Presets: tiktok, mrbeast, clean
+    """
+    try:
+        check_fal_key()
+        rv = resolve_output_path(video_path)
+        rs = resolve_output_path(subtitles_path)
+        out = resolve_output_path(output_filename)
+
+        if not rv.exists():
+            return f"Error: video file not found at {rv}"
+        if not rs.exists():
+            return f"Error: subtitle file not found at {rs}"
+
+        presets = {
+            "tiktok": {
+                "outline": 3,
+                "border_style": 1,
+                "shadow": 0,
+                "align": 2,
+            },
+            "mrbeast": {
+                "outline": 4,
+                "border_style": 1,
+                "shadow": 0,
+                "align": 2,
+            },
+            "clean": {
+                "outline": 2,
+                "border_style": 1,
+                "shadow": 0,
+                "align": 2,
+            },
+        }
+        p = presets.get(style_preset, presets["mrbeast"])
+
+        sub_esc = str(rs).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        style = (
+            f"Fontname=Arial,FontSize={font_size},PrimaryColour={primary_color_bgr},"
+            f"OutlineColour=&H000000,Outline={p['outline']},Shadow={p['shadow']},"
+            f"BorderStyle={p['border_style']},Alignment={p['align']},MarginV={margin_v}"
+        )
+        vf = f"subtitles='{sub_esc}':force_style='{style}'"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(rv),
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-c:a", "copy",
+            str(out),
+        ]
+
+        if ctx:
+            await ctx.info(f"Burning subtitles with preset={style_preset}...")
+
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        public_url = await fal_client.upload_file_async(str(out))
+        archive = copy_to_archive(out)
+        return format_result("subtitle-burned video", "ffmpeg", str(out), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed to burn subtitles: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed to burn subtitles: {str(e)}"
 
 
 # =============================================================================
