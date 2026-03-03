@@ -415,6 +415,31 @@ Example: If user wants AI music only on a 10-second portion of a local video,
 first trim_media that portion, then generate_audio, then merge_audio_video,
 and finally concatenate_media clips back if needed.
 
+🛠️ FFMPEG GOD MODE CHEAT SHEET (VIRAL EDITING):
+Use these inside execute_raw_ffmpeg.custom_ffmpeg_args (list of strings).
+
+1) TikTok/Hormozi subtitles (yellow + black border)
+- Filter snippet:
+  subtitles=file.srt:force_style='Fontname=Arial,FontSize=24,PrimaryColour=&H00FFFF,OutlineColour=&H000000,Outline=2,BorderStyle=3,Alignment=2'
+- Note: &H00FFFF corresponds to yellow in BGR-style ASS notation.
+
+2) Punch-in zoom (115%)
+- Filter snippet:
+  crop=w=iw/1.15:h=ih/1.15:x=(iw-ow)/2:y=(ih-oh)/2,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2
+- For timed punch-ins, use enable='between(t,START,END)' when applicable.
+
+3) Audio ducking (voice input 0 + bg music input 1 @10%)
+- Args pattern:
+  ["-filter_complex", "[1:a]volume=0.1[bg];[0:a][bg]amix=inputs=2:duration=first[aout]", "-map", "0:v", "-map", "[aout]"]
+
+4) Blur background for vertical from horizontal source
+- Filter snippet:
+  [0:v]scale=1080:-1,boxblur=20:10[bg];[0:v]scale=1080:-1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1
+
+5) Quick cinematic color pop
+- Filter snippet:
+  eq=contrast=1.1:brightness=0.02:saturation=1.3
+
 🎬 VIRAL SHORT CLONE WORKFLOW (THE OPUSCLIP STRATEGY):
 When user says "make this video viral", follow this sequence:
 1) Transcribe: call generate_subtitles_file to get text + timing.
