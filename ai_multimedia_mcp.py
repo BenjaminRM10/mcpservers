@@ -591,6 +591,7 @@ async def generate_video(
     prompt_optimizer: bool = True,
     confirm_cost: bool = False,
     acknowledged_estimated_cost_usd: Optional[float] = None,
+    max_budget_usd: float = 2.0,
     ctx: Context = None
 ) -> str:
     """
@@ -618,6 +619,8 @@ async def generate_video(
     - First call MUST use confirm_cost=False (default). The tool will return an estimate and stop.
     - Show the estimate to the user and ask for explicit confirmation.
     - Second call must set confirm_cost=True and pass acknowledged_estimated_cost_usd with the shown estimate.
+    - max_budget_usd (default 2.0): if estimated cost exceeds this value, generation is blocked immediately.
+      To proceed, explicitly raise max_budget_usd in your call.
 
     Hailuo camera movements (include in prompt): [Pan left], [Zoom in], [Tracking shot],
     [Tilt up/down], [Push in], [Pull out], [Pedestal up/down], [Truck left/right], [Static shot].
@@ -637,13 +640,23 @@ async def generate_video(
         elif engine == "minimax":
             estimated_cost_usd = 0.28 if duration <= 6 else 0.56
 
+        if estimated_cost_usd > max_budget_usd:
+            return (
+                "BUDGET_EXCEEDED\n"
+                f"estimated_cost_usd={estimated_cost_usd:.2f}\n"
+                f"max_budget_usd={max_budget_usd:.2f}\n\n"
+                "Generation blocked by budget guardrail. "
+                "If the user explicitly accepts a higher budget, call again with a higher max_budget_usd."
+            )
+
         if not confirm_cost:
             return (
                 "COST_ESTIMATE_REQUIRED\n"
                 f"engine={engine}\n"
                 f"duration={duration}s\n"
                 f"generate_audio={generate_audio}\n"
-                f"estimated_cost_usd={estimated_cost_usd:.2f}\n\n"
+                f"estimated_cost_usd={estimated_cost_usd:.2f}\n"
+                f"max_budget_usd={max_budget_usd:.2f}\n\n"
                 "This is a paid generation. Show this estimate to the user and ask for explicit confirmation. "
                 "Then call generate_video again with confirm_cost=true and acknowledged_estimated_cost_usd set to this exact estimate."
             )
