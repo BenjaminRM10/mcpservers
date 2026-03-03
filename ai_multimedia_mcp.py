@@ -623,11 +623,11 @@ async def generate_video(
 
         if ctx:
             cost_hint = f" (confirmed estimate: ~${estimated_cost_usd:.2f})"
-            await ctx.info(f"Generating video with '{model}'{cost_hint}... This may take 30-120 seconds.")
+            await ctx.info(f"Generating video with '{model}'{cost_hint}... This may take 30-900 seconds depending on queue load.")
             await ctx.report_progress(progress=0.1, total=1.0)
 
         result = await fal_client.subscribe_async(
-            model, arguments=arguments, with_logs=True, client_timeout=300.0
+            model, arguments=arguments, with_logs=True, client_timeout=900.0
         )
 
         if ctx:
@@ -641,7 +641,14 @@ async def generate_video(
         return f"Unexpected response from {engine}: {str(result)}"
 
     except Exception as e:
-        return f"Failed to generate video: {str(e)}"
+        err = str(e)
+        if "timed out" in err and "Request " in err:
+            return (
+                f"Failed to generate video: {err}\n"
+                "Tip: provider queue is congested. Re-run later or switch engine. "
+                "If a request_id appears above, keep it for support/recredit."
+            )
+        return f"Failed to generate video: {err}"
 
 
 # =============================================================================
