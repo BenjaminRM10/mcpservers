@@ -5,6 +5,7 @@ import subprocess
 import json
 import re
 import tempfile
+import asyncio
 
 try:
     from bs4 import BeautifulSoup
@@ -158,7 +159,6 @@ def _split_caption_chunks(text: str, min_words: int = 2, max_words: int = 5) -> 
     # final guard: never empty, and avoid 1-word captions when possible
     if len(chunks) >= 2:
         normalized = []
-        carry = None
         for c in chunks:
             wc = c.split()
             if len(wc) == 1 and normalized:
@@ -170,51 +170,89 @@ def _split_caption_chunks(text: str, min_words: int = 2, max_words: int = 5) -> 
     return chunks
 
 
-def _segments_to_srt(segments: list[dict], min_words_per_caption: int = 2, max_words_per_caption: int = 5) -> str:
-    lines = []
-    idx = 1
+def _segments_to_caption_events(segments: list[dict], min_words_per_caption: int = 2, max_words_per_caption: int = 5) -> list[dict]:
+    """Build caption events with best possible timing.
+    - If word-level timing exists, preserve it.
+    - Otherwise fallback to segment split timing.
+    """
+    events: list[dict] = []
+
     for seg in segments:
-        start = float(seg.get("start", 0) or 0)
-        end = float(seg.get("end", start + 2) or (start + 2))
-        if end <= start:
-            end = start + 1.2
+        seg_start = float(seg.get("start", 0) or 0)
+        seg_end = float(seg.get("end", seg_start + 2) or (seg_start + 2))
+        if seg_end <= seg_start:
+            seg_end = seg_start + 1.2
+
+        words = seg.get("words") or []
+        # Word-level timestamps path (best sync)
+        timed_words = []
+        for w in words:
+            ws = w.get("start")
+            we = w.get("end")
+            wt = (w.get("word") or w.get("text") or "").strip()
+            if ws is not None and we is not None and wt:
+                timed_words.append({"start": float(ws), "end": float(we), "word": wt})
+
+        if timed_words:
+            i = 0
+            n = len(timed_words)
+            while i < n:
+                remaining = n - i
+                take = min(max_words_per_caption, remaining)
+                if remaining - take == 1 and take > min_words_per_caption:
+                    take -= 1
+
+                chunk = timed_words[i:i + take]
+                text = " ".join(x["word"] for x in chunk).strip()
+                start = chunk[0]["start"]
+                end = chunk[-1]["end"]
+                if end <= start:
+                    end = start + 0.8
+                events.append({"start": start, "end": end, "text": text})
+                i += take
+            continue
+
+        # Fallback: segment-level split
         text = (seg.get("text") or "").strip() or "..."
         chunks = _split_caption_chunks(text, min_words=min_words_per_caption, max_words=max_words_per_caption)
         total = max(1, len(chunks))
-        dur = max(0.8, (end - start) / total)
-        t0 = start
+        dur = max(0.8, (seg_end - seg_start) / total)
+        t0 = seg_start
         for ch in chunks:
-            t1 = min(end, t0 + dur)
-            lines.append(str(idx))
-            lines.append(f"{_fmt_ts(t0)} --> {_fmt_ts(t1)}")
-            lines.append(ch)
-            lines.append("")
-            idx += 1
+            t1 = min(seg_end, t0 + dur)
+            events.append({"start": t0, "end": t1, "text": ch})
             t0 = t1
+
+    return events
+
+
+def _segments_to_srt(segments: list[dict], min_words_per_caption: int = 2, max_words_per_caption: int = 5) -> str:
+    lines = []
+    events = _segments_to_caption_events(
+        segments,
+        min_words_per_caption=min_words_per_caption,
+        max_words_per_caption=max_words_per_caption,
+    )
+    for idx, ev in enumerate(events, start=1):
+        lines.append(str(idx))
+        lines.append(f"{_fmt_ts(ev['start'])} --> {_fmt_ts(ev['end'])}")
+        lines.append((ev.get("text") or "...").strip() or "...")
+        lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
 def _segments_to_vtt(segments: list[dict], min_words_per_caption: int = 2, max_words_per_caption: int = 5) -> str:
     lines = ["WEBVTT", ""]
-    idx = 1
-    for seg in segments:
-        start = float(seg.get("start", 0) or 0)
-        end = float(seg.get("end", start + 2) or (start + 2))
-        if end <= start:
-            end = start + 1.2
-        text = (seg.get("text") or "").strip() or "..."
-        chunks = _split_caption_chunks(text, min_words=min_words_per_caption, max_words=max_words_per_caption)
-        total = max(1, len(chunks))
-        dur = max(0.8, (end - start) / total)
-        t0 = start
-        for ch in chunks:
-            t1 = min(end, t0 + dur)
-            lines.append(str(idx))
-            lines.append(f"{_fmt_ts(t0, vtt=True)} --> {_fmt_ts(t1, vtt=True)}")
-            lines.append(ch)
-            lines.append("")
-            idx += 1
-            t0 = t1
+    events = _segments_to_caption_events(
+        segments,
+        min_words_per_caption=min_words_per_caption,
+        max_words_per_caption=max_words_per_caption,
+    )
+    for idx, ev in enumerate(events, start=1):
+        lines.append(str(idx))
+        lines.append(f"{_fmt_ts(ev['start'], vtt=True)} --> {_fmt_ts(ev['end'], vtt=True)}")
+        lines.append((ev.get("text") or "...").strip() or "...")
+        lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -1121,8 +1159,47 @@ async def execute_raw_ffmpeg(
 
         if ctx:
             await ctx.info("Executing raw FFmpeg command...")
+            await ctx.report_progress(progress=0.02, total=1.0)
 
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # Async execution with progress scraping from ffmpeg stderr
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        frame_re = re.compile(r"frame=\s*(\d+)")
+        time_re = re.compile(r"time=([0-9:.]+)")
+        frames_seen = 0
+
+        # Read stderr lines while running
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            txt = line.decode("utf-8", errors="ignore").strip()
+
+            m = frame_re.search(txt)
+            if m:
+                try:
+                    frames_seen = int(m.group(1))
+                except Exception:
+                    pass
+                if ctx and frames_seen % 150 == 0 and frames_seen > 0:
+                    tmatch = time_re.search(txt)
+                    tval = tmatch.group(1) if tmatch else "?"
+                    # best-effort pseudo progress based on frames; capped until completion
+                    p = min(0.95, 0.05 + (frames_seen / 6000.0))
+                    await ctx.report_progress(progress=p, total=1.0)
+                    await ctx.info(f"ffmpeg progress: frame={frames_seen}, time={tval}")
+
+        stdout_b, stderr_b = await proc.communicate()
+        if proc.returncode != 0:
+            stderr = (stderr_b.decode("utf-8", errors="ignore") if stderr_b else "").strip()
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout_b, stderr=stderr)
+
+        if ctx:
+            await ctx.report_progress(progress=1.0, total=1.0)
 
         public_url = await fal_client.upload_file_async(str(output_path))
         archive = copy_to_archive(output_path)
