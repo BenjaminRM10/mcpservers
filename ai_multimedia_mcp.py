@@ -2,6 +2,7 @@ import os
 import shutil
 import httpx
 import subprocess
+import json
 from pathlib import Path
 from typing import Optional, Literal
 from mcp.server.fastmcp import FastMCP, Context
@@ -14,6 +15,7 @@ mcp = FastMCP("ai-multimedia-supreme")
 
 # Fixed backup directory for all generated media
 MEDIA_ARCHIVE_DIR = Path.home() / "Documents" / "ai-multimedia-files"
+FAL_DOCS_MCP_URL = "https://docs.fal.ai/mcp"
 
 
 def get_google_client():
@@ -93,6 +95,88 @@ def format_result(media_type: str, engine: str, local_path: str, public_url: str
 
 
 # =============================================================================
+# FAL DOCS BRIDGE (embedded docs consultation)
+# =============================================================================
+
+@mcp.tool()
+async def consult_fal_docs(
+    topic: str,
+    model_hint: Optional[str] = None,
+    max_chars: int = 12000,
+    ctx: Context = None
+) -> str:
+    """
+    Consults Fal documentation sources before generation/update decisions.
+
+    Strategy:
+    1) Try Fal Docs MCP endpoint (`https://docs.fal.ai/mcp`) via JSON-RPC best-effort
+       to discover available docs tools.
+    2) Fallback to fetching human docs pages from docs.fal.ai.
+
+    Use this tool before complex model routing or when verifying latest endpoints/pricing.
+    """
+    snippets = []
+    if ctx:
+        await ctx.info("Consulting Fal docs sources...")
+
+    # 1) Best-effort MCP introspection
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            init_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "ai-multimedia-supreme", "version": "1.0"}
+                }
+            }
+            init_res = await http.post(FAL_DOCS_MCP_URL, json=init_payload)
+            init_text = init_res.text[:1200]
+            snippets.append(f"[Fal Docs MCP initialize]\nstatus={init_res.status_code}\n{init_text}")
+
+            list_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            list_res = await http.post(FAL_DOCS_MCP_URL, json=list_payload)
+            list_text = list_res.text[:3000]
+            snippets.append(f"[Fal Docs MCP tools/list]\nstatus={list_res.status_code}\n{list_text}")
+    except Exception as e:
+        snippets.append(f"[Fal Docs MCP unavailable] {e}")
+
+    # 2) Fallback web docs pages
+    docs_urls = [
+        "https://docs.fal.ai/",
+        "https://docs.fal.ai/model-apis",
+        "https://docs.fal.ai/model-apis/guides",
+    ]
+    if model_hint:
+        docs_urls.append(f"https://docs.fal.ai/model-apis/{model_hint}")
+
+    for url in docs_urls:
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
+                r = await http.get(url)
+                text = r.text
+                # naive topical extraction
+                if topic.lower() in text.lower() or len(snippets) < 5:
+                    snippets.append(f"[Docs: {url}]\nstatus={r.status_code}\n{text[:2200]}")
+        except Exception as e:
+            snippets.append(f"[Docs fetch failed: {url}] {e}")
+
+    joined = "\n\n".join(snippets)
+    if len(joined) > max_chars:
+        joined = joined[:max_chars] + "\n...[truncated]"
+
+    return (
+        "FAL_DOCS_CONSULTED\n"
+        f"topic={topic}\n"
+        f"model_hint={model_hint or 'none'}\n\n"
+        f"{joined}\n\n"
+        "Use this information to verify model IDs/endpoints before generation."
+    )
+
+
+# =============================================================================
 # CONSULTATION TOOL — Must be called first to discuss options with the user
 # =============================================================================
 
@@ -118,6 +202,10 @@ The user does NOT have to generate every asset with AI.
 Always ask first: "Do you want to generate assets from scratch, or use your own existing local files?"
 You can accept absolute local file paths (e.g., /home/user/video.mp4 or /home/user/voice.m4a)
 and pass them directly into tools like merge_audio_video or create_talking_avatar.
+
+FAL DOCS ENFORCEMENT:
+Before finalizing model choice or endpoint routing (especially after recent updates), call consult_fal_docs.
+Use docs findings to adapt the plan and avoid outdated/removed endpoints.
 """
 
     if media_type == "image":
@@ -603,10 +691,10 @@ async def generate_video(
         elif engine == "runway":
             # Runway supports T2V / I2V / V2V
             if input_video_url:
-                model = "fal-ai/runway/gen-4-turbo/video-to-video"
+                model = "fal-ai/runway-gen3/video-to-video"
                 arguments["video_url"] = input_video_url
             else:
-                model = "fal-ai/runway/gen-4-turbo/image-to-video" if image_url else "fal-ai/runway/gen-4-turbo/text-to-video"
+                model = "fal-ai/runway-gen3/image-to-video" if image_url else "fal-ai/runway-gen3/text-to-video"
                 if image_url:
                     arguments["image_url"] = image_url
 
