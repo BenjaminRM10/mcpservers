@@ -4,6 +4,7 @@ import httpx
 import subprocess
 import json
 import re
+import tempfile
 
 try:
     from bs4 import BeautifulSoup
@@ -225,6 +226,13 @@ Use docs findings to adapt the plan and avoid outdated/removed endpoints.
 PICTURE-IN-PICTURE (PiP):
 If the user wants to overlay a talking avatar or a camera feed onto a background video
 (like a screen recording), use the create_pip_video tool to combine two local videos.
+
+TRADITIONAL NLE EDITING (LOCAL FFMPEG):
+You also have local non-linear editing tools: trim_media, concatenate_media, extract_audio.
+Chain them with AI generation tools for advanced workflows.
+Example: If user wants AI music only on a 10-second portion of a local video,
+first trim_media that portion, then generate_audio, then merge_audio_video,
+and finally concatenate_media clips back if needed.
 """
 
     if media_type == "image":
@@ -567,6 +575,151 @@ async def create_pip_video(
         return f"Failed to create PiP video with ffmpeg: {stderr or str(e)}"
     except Exception as e:
         return f"Failed to create PiP video: {str(e)}"
+
+
+@mcp.tool()
+async def trim_media(
+    input_path: str,
+    start_time: str,
+    end_time: Optional[str],
+    output_filename: str,
+    ctx: Context = None,
+) -> str:
+    """
+    Trims local media using ffmpeg stream copy (no re-encode).
+    - start_time supports formats like "10" or "00:00:10".
+    - end_time is optional; if provided, passed as -to.
+    """
+    try:
+        check_fal_key()
+        resolved_input = resolve_output_path(input_path)
+        output_path = resolve_output_path(output_filename)
+
+        if not resolved_input.exists():
+            return f"Error: input file not found at {resolved_input}"
+
+        cmd = ["ffmpeg", "-y", "-i", str(resolved_input), "-ss", start_time]
+        if end_time:
+            cmd.extend(["-to", end_time])
+        cmd.extend(["-c", "copy", str(output_path)])
+
+        if ctx:
+            await ctx.info("Trimming media with FFmpeg...")
+
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        public_url = await fal_client.upload_file_async(str(output_path))
+        archive = copy_to_archive(output_path)
+        return format_result("trimmed media", "ffmpeg", str(output_path), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed to trim media with ffmpeg: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed to trim media: {str(e)}"
+
+
+@mcp.tool()
+async def concatenate_media(
+    input_paths: list[str],
+    output_filename: str,
+    ctx: Context = None,
+) -> str:
+    """
+    Concatenates multiple local media files using ffmpeg concat demuxer.
+    """
+    try:
+        check_fal_key()
+        if not input_paths or len(input_paths) < 2:
+            return "Error: input_paths must contain at least 2 files."
+
+        resolved_paths = [resolve_output_path(p) for p in input_paths]
+        for p in resolved_paths:
+            if not p.exists():
+                return f"Error: input file not found at {p}"
+
+        output_path = resolve_output_path(output_filename)
+
+        if ctx:
+            await ctx.info("Preparing concat list...")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix="_concat_list.txt", delete=False, dir=str(Path.cwd())) as tf:
+            concat_list_path = Path(tf.name)
+            for p in resolved_paths:
+                escaped = str(p).replace("'", "'\\''")
+                tf.write(f"file '{escaped}'\n")
+
+        try:
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_list_path),
+                "-c", "copy",
+                str(output_path),
+            ]
+            if ctx:
+                await ctx.info("Concatenating media with FFmpeg...")
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        finally:
+            try:
+                concat_list_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        public_url = await fal_client.upload_file_async(str(output_path))
+        archive = copy_to_archive(output_path)
+        return format_result("concatenated media", "ffmpeg", str(output_path), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed to concatenate media with ffmpeg: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed to concatenate media: {str(e)}"
+
+
+@mcp.tool()
+async def extract_audio(
+    video_path: str,
+    output_filename: str,
+    ctx: Context = None,
+) -> str:
+    """
+    Extracts audio track from local video.
+    - .mp3 => libmp3lame -q:a 2
+    - .m4a/.aac => aac
+    """
+    try:
+        check_fal_key()
+        resolved_video = resolve_output_path(video_path)
+        output_path = resolve_output_path(output_filename)
+
+        if not resolved_video.exists():
+            return f"Error: video file not found at {resolved_video}"
+
+        ext = output_path.suffix.lower()
+        cmd = ["ffmpeg", "-y", "-i", str(resolved_video), "-vn"]
+        if ext == ".mp3":
+            cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+        elif ext in {".m4a", ".aac"}:
+            cmd.extend(["-c:a", "aac"])
+
+        cmd.append(str(output_path))
+
+        if ctx:
+            await ctx.info("Extracting audio with FFmpeg...")
+
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        public_url = await fal_client.upload_file_async(str(output_path))
+        archive = copy_to_archive(output_path)
+        return format_result("extracted audio", "ffmpeg", str(output_path), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed to extract audio with ffmpeg: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed to extract audio: {str(e)}"
 
 
 # =============================================================================
