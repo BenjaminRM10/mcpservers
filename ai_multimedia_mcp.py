@@ -221,6 +221,10 @@ and pass them directly into tools like merge_audio_video or create_talking_avata
 FAL DOCS ENFORCEMENT:
 Before finalizing model choice or endpoint routing (especially after recent updates), call consult_fal_docs.
 Use docs findings to adapt the plan and avoid outdated/removed endpoints.
+
+PICTURE-IN-PICTURE (PiP):
+If the user wants to overlay a talking avatar or a camera feed onto a background video
+(like a screen recording), use the create_pip_video tool to combine two local videos.
 """
 
     if media_type == "image":
@@ -461,6 +465,108 @@ async def merge_audio_video(
         return f"Failed to merge with ffmpeg: {stderr or str(e)}"
     except Exception as e:
         return f"Failed to merge audio+video: {str(e)}"
+
+
+@mcp.tool()
+async def create_pip_video(
+    main_video_path: str,
+    overlay_video_path: str,
+    output_filename: str,
+    position: Literal["bottom-right", "bottom-left", "top-right", "top-left"] = "bottom-right",
+    ctx: Context = None,
+) -> str:
+    """
+    Creates a Picture-in-Picture (PiP) video from two local videos.
+
+    - Scales overlay video to 25% of main video width.
+    - Places overlay with 20px padding according to `position`.
+    - Preserves overlay audio at minimum; mixes main+overlay audio when possible.
+    - Uses -shortest in final output.
+    """
+    try:
+        check_fal_key()
+
+        resolved_main = resolve_output_path(main_video_path)
+        resolved_overlay = resolve_output_path(overlay_video_path)
+        output_path = resolve_output_path(output_filename)
+
+        if not resolved_main.exists():
+            return f"Error: main video file not found at {resolved_main}"
+        if not resolved_overlay.exists():
+            return f"Error: overlay video file not found at {resolved_overlay}"
+
+        if ctx:
+            await ctx.info("Building PiP video with local FFmpeg...")
+
+        # Detect if main video has audio, so we can mix when possible.
+        has_main_audio = False
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "a",
+                    "-show_entries", "stream=index",
+                    "-of", "json",
+                    str(resolved_main),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            data = json.loads(probe.stdout or "{}")
+            has_main_audio = bool(data.get("streams"))
+        except Exception:
+            has_main_audio = False
+
+        position_map = {
+            "bottom-right": "W-w-20:H-h-20",
+            "bottom-left": "20:H-h-20",
+            "top-right": "W-w-20:20",
+            "top-left": "20:20",
+        }
+        overlay_xy = position_map.get(position, "W-w-20:H-h-20")
+
+        if has_main_audio:
+            filter_complex = (
+                f"[1:v][0:v]scale2ref=w=iw*0.25:h=ow/mdar[ovr][base];"
+                f"[base][ovr]overlay={overlay_xy}[vout];"
+                f"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+            )
+            map_args = ["-map", "[vout]", "-map", "[aout]"]
+        else:
+            filter_complex = (
+                f"[1:v][0:v]scale2ref=w=iw*0.25:h=ow/mdar[ovr][base];"
+                f"[base][ovr]overlay={overlay_xy}[vout]"
+            )
+            # At minimum preserve overlay audio
+            map_args = ["-map", "[vout]", "-map", "1:a?"]
+
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(resolved_main),
+            "-i", str(resolved_overlay),
+            "-filter_complex", filter_complex,
+            *map_args,
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-shortest",
+            str(output_path),
+        ]
+
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+
+        if ctx:
+            await ctx.info("Uploading PiP output to Fal storage...")
+
+        public_url = await fal_client.upload_file_async(str(output_path))
+        archive = copy_to_archive(output_path)
+        return format_result("pip video", "ffmpeg", str(output_path), public_url, str(archive))
+
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return f"Failed to create PiP video with ffmpeg: {stderr or str(e)}"
+    except Exception as e:
+        return f"Failed to create PiP video: {str(e)}"
 
 
 # =============================================================================
