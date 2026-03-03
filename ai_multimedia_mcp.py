@@ -126,29 +126,61 @@ def _fmt_ts(seconds: float, vtt: bool = False) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
-def _segments_to_srt(segments: list[dict]) -> str:
+def _split_caption_chunks(text: str, max_words: int = 5) -> list[str]:
+    words = (text or "").strip().split()
+    if not words:
+        return ["..."]
+    chunks = []
+    for i in range(0, len(words), max_words):
+        chunks.append(" ".join(words[i:i + max_words]))
+    return chunks
+
+
+def _segments_to_srt(segments: list[dict], max_words_per_caption: int = 5) -> str:
     lines = []
-    for i, seg in enumerate(segments, start=1):
-        start = seg.get("start", 0)
-        end = seg.get("end", start + 2)
+    idx = 1
+    for seg in segments:
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end", start + 2) or (start + 2))
+        if end <= start:
+            end = start + 1.2
         text = (seg.get("text") or "").strip() or "..."
-        lines.append(str(i))
-        lines.append(f"{_fmt_ts(start)} --> {_fmt_ts(end)}")
-        lines.append(text)
-        lines.append("")
+        chunks = _split_caption_chunks(text, max_words=max_words_per_caption)
+        total = max(1, len(chunks))
+        dur = max(0.8, (end - start) / total)
+        t0 = start
+        for ch in chunks:
+            t1 = min(end, t0 + dur)
+            lines.append(str(idx))
+            lines.append(f"{_fmt_ts(t0)} --> {_fmt_ts(t1)}")
+            lines.append(ch)
+            lines.append("")
+            idx += 1
+            t0 = t1
     return "\n".join(lines).strip() + "\n"
 
 
-def _segments_to_vtt(segments: list[dict]) -> str:
+def _segments_to_vtt(segments: list[dict], max_words_per_caption: int = 5) -> str:
     lines = ["WEBVTT", ""]
-    for i, seg in enumerate(segments, start=1):
-        start = seg.get("start", 0)
-        end = seg.get("end", start + 2)
+    idx = 1
+    for seg in segments:
+        start = float(seg.get("start", 0) or 0)
+        end = float(seg.get("end", start + 2) or (start + 2))
+        if end <= start:
+            end = start + 1.2
         text = (seg.get("text") or "").strip() or "..."
-        lines.append(str(i))
-        lines.append(f"{_fmt_ts(start, vtt=True)} --> {_fmt_ts(end, vtt=True)}")
-        lines.append(text)
-        lines.append("")
+        chunks = _split_caption_chunks(text, max_words=max_words_per_caption)
+        total = max(1, len(chunks))
+        dur = max(0.8, (end - start) / total)
+        t0 = start
+        for ch in chunks:
+            t1 = min(end, t0 + dur)
+            lines.append(str(idx))
+            lines.append(f"{_fmt_ts(t0, vtt=True)} --> {_fmt_ts(t1, vtt=True)}")
+            lines.append(ch)
+            lines.append("")
+            idx += 1
+            t0 = t1
     return "\n".join(lines).strip() + "\n"
 
 
@@ -304,6 +336,7 @@ async def generate_subtitles_file(
     audio_or_video_url: str,
     format: Literal["srt", "vtt", "json"] = "srt",
     output_filename: str = "subtitles.srt",
+    max_words_per_caption: int = 5,
     ctx: Context = None,
 ) -> str:
     """
@@ -348,9 +381,9 @@ async def generate_subtitles_file(
         if fmt == "json":
             output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         elif fmt == "vtt":
-            output_path.write_text(_segments_to_vtt(segments), encoding="utf-8")
+            output_path.write_text(_segments_to_vtt(segments, max_words_per_caption=max_words_per_caption), encoding="utf-8")
         else:
-            output_path.write_text(_segments_to_srt(segments), encoding="utf-8")
+            output_path.write_text(_segments_to_srt(segments, max_words_per_caption=max_words_per_caption), encoding="utf-8")
 
         return (
             "SUBTITLES_GENERATED\n"
