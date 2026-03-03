@@ -153,6 +153,10 @@ OUTPUT: Saves to current working directory AND backup copy to ~/Documents/ai-mul
 {global_rule}
 === VIDEO GENERATION OPTIONS ===
 
+NEW: Video-to-Video (Restyling/Transformation) is now supported.
+You can transform an existing video into a new style (e.g., "Transform the person into a 3D claymation character").
+If the user provides a local MP4 path, the system can auto-upload and process it.
+
 ENGINES (ask the user which one):
 1. "kling" — Kling 3.0 Pro (Fal.ai)
    Price: ~$0.10/sec (varies by mode) | Best for: Cinematic quality, character consistency, realistic physics
@@ -180,8 +184,9 @@ C) Complex Physics/Lip-sync (~$1.30+)
    - MUST warn user this path is significantly more expensive before generation.
 
 QUESTIONS YOU MUST ASK THE USER:
-- Text-to-Video or Image-to-Video? (If i2v, they need an image PUBLIC_URL or local path)
-- Which engine? Explain the price/quality differences.
+- Is this Text-to-Video, Image-to-Video, or Video-to-Video?
+- If Video-to-Video: ask for an input video (PUBLIC_URL or absolute local MP4 path) and confirm the desired transformation style.
+- Which engine? Explain the price/quality differences. Explicitly state Minimax is not available for Video-to-Video.
 - Duration: 5, 10, or 15 seconds (Kling only)? (videos are expensive — confirm budget)
 - Aspect ratio: 16:9 (landscape), 9:16 (vertical/mobile), 1:1 (square)?
 - For Kling: Native audio generation? (doubles cost but adds voiceover/sounds)
@@ -491,6 +496,7 @@ async def generate_video(
     duration: Literal[5, 6, 10, 15],
     aspect_ratio: Literal["16:9", "9:16", "1:1"] = "16:9",
     image_url: Optional[str] = None,
+    input_video_url: Optional[str] = None,
     generate_audio: bool = False,
     negative_prompt: Optional[str] = None,
     cfg_scale: Optional[float] = None,
@@ -506,11 +512,13 @@ async def generate_video(
     Call consult_multimedia_options("video") first to discuss options with the user.
 
     Engines:
-    - kling: Kling 3.0 Pro (Fal.ai). Duration: 5, 10, or 15 sec.
-    - runway: Runway Gen-4 Turbo (Fal.ai). Duration: 5 or 10 sec.
-    - minimax: Hailuo 2.3 ($0.28/6sec, $0.56/10sec). Duration: 6 or 10 sec.
+    - kling: Kling 3.0 Pro (Fal.ai). Supports text-to-video, image-to-video, and video-to-video.
+    - runway: Runway Gen-4 Turbo (Fal.ai). Supports text-to-video, image-to-video, and video-to-video.
+    - minimax: Hailuo 2.3 ($0.28/6sec, $0.56/10sec). Supports text-to-video and image-to-video.
 
-    For image-to-video: pass image_url (PUBLIC_URL from generate_image, or local path).
+    Inputs:
+    - image_url: for image-to-video (PUBLIC_URL from generate_image, or local path)
+    - input_video_url: for video-to-video restyling/transformation (PUBLIC_URL or local path)
 
     Advanced params:
     - generate_audio: Native audio for Kling (English/Chinese). Doubles cost.
@@ -569,14 +577,20 @@ async def generate_video(
 
         if image_url:
             image_url = await ensure_public_url(image_url)
+        if input_video_url:
+            input_video_url = await ensure_public_url(input_video_url)
 
         arguments = {"prompt": prompt}
 
         if engine == "kling":
-            # UPDATED to Kling 3.0 Pro
-            model = "fal-ai/kling-video/v3/pro/image-to-video" if image_url else "fal-ai/kling-video/v3/pro/text-to-video"
-            if image_url:
-                arguments["image_url"] = image_url
+            # Kling supports T2V / I2V / V2V
+            if input_video_url:
+                model = "fal-ai/kling-video/v3/pro/video-to-video"
+                arguments["video_url"] = input_video_url
+            else:
+                model = "fal-ai/kling-video/v3/pro/image-to-video" if image_url else "fal-ai/kling-video/v3/pro/text-to-video"
+                if image_url:
+                    arguments["image_url"] = image_url
             arguments["duration"] = duration
             arguments["aspect_ratio"] = aspect_ratio
             if generate_audio:
@@ -587,12 +601,18 @@ async def generate_video(
                 arguments["cfg_scale"] = cfg_scale
 
         elif engine == "runway":
-            # UPDATED to Runway Gen-4 Turbo
-            model = "fal-ai/runway/gen-4-turbo/image-to-video" if image_url else "fal-ai/runway/gen-4-turbo/text-to-video"
-            if image_url:
-                arguments["image_url"] = image_url
+            # Runway supports T2V / I2V / V2V
+            if input_video_url:
+                model = "fal-ai/runway/gen-4-turbo/video-to-video"
+                arguments["video_url"] = input_video_url
+            else:
+                model = "fal-ai/runway/gen-4-turbo/image-to-video" if image_url else "fal-ai/runway/gen-4-turbo/text-to-video"
+                if image_url:
+                    arguments["image_url"] = image_url
 
         elif engine == "minimax":
+            if input_video_url:
+                return "Minimax currently does not support Video-to-Video. Please use Kling or Runway."
             model = "fal-ai/minimax/hailuo-2.3/standard/image-to-video" if image_url else "fal-ai/minimax/hailuo-2.3/standard/text-to-video"
             if image_url:
                 arguments["image_url"] = image_url
