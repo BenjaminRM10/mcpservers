@@ -3,6 +3,12 @@ import shutil
 import httpx
 import subprocess
 import json
+import re
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 from pathlib import Path
 from typing import Optional, Literal
 from mcp.server.fastmcp import FastMCP, Context
@@ -156,8 +162,17 @@ async def consult_fal_docs(
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
                 r = await http.get(url)
-                text = r.text
-                # naive topical extraction
+                raw_html = r.text
+                if BeautifulSoup is not None:
+                    text = BeautifulSoup(raw_html, "html.parser").get_text(separator="\n", strip=True)
+                else:
+                    # Fallback text extraction without bs4
+                    text = re.sub(r"<script[\s\S]*?</script>", " ", raw_html, flags=re.IGNORECASE)
+                    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+                    text = re.sub(r"<[^>]+>", " ", text)
+                    text = re.sub(r"\s+", " ", text).strip()
+
+                # topical extraction on cleaned text
                 if topic.lower() in text.lower() or len(snippets) < 5:
                     snippets.append(f"[Docs: {url}]\nstatus={r.status_code}\n{text[:2200]}")
         except Exception as e:
