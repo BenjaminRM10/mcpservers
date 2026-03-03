@@ -37,6 +37,11 @@ def check_fal_key():
         raise ValueError("FAL_KEY environment variable is not set.")
 
 
+def check_tavily_key():
+    if not os.getenv("TAVILY_API_KEY"):
+        raise ValueError("TAVILY_API_KEY environment variable is not set.")
+
+
 async def download_file(url: str, output_path: Path) -> None:
     """Downloads a file from a URL and saves it locally."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,6 +197,62 @@ async def consult_fal_docs(
     )
 
 
+@mcp.tool()
+async def search_multimedia_tech(
+    query: str,
+    search_depth: Literal["basic", "advanced"] = "basic",
+    ctx: Context = None,
+) -> str:
+    """
+    Real-time technical search using Tavily API.
+    Use for up-to-date FFmpeg syntax, Fal model pricing/routes, and multimedia trends.
+    """
+    try:
+        check_tavily_key()
+        if ctx:
+            await ctx.info("Searching real-time technical web sources via Tavily...")
+
+        payload = {
+            "api_key": os.getenv("TAVILY_API_KEY"),
+            "query": query,
+            "search_depth": search_depth,
+            "include_answer": True,
+        }
+        headers = {"Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=35.0, follow_redirects=True) as http:
+            res = await http.post("https://api.tavily.com/search", headers=headers, json=payload)
+            res.raise_for_status()
+            data = res.json()
+
+        answer = data.get("answer") or "No direct answer returned."
+        results = data.get("results") or []
+
+        lines = [
+            "TAVILY_TECH_SEARCH",
+            f"Query: {query}",
+            f"Depth: {search_depth}",
+            "",
+            f"Answer: {answer}",
+            "",
+            "Top sources:",
+        ]
+
+        for i, r in enumerate(results[:3], start=1):
+            title = r.get("title") or "(untitled)"
+            url = r.get("url") or "(no-url)"
+            content = (r.get("content") or "").strip().replace("\n", " ")
+            lines.append(f"{i}. {title}")
+            lines.append(f"   URL: {url}")
+            if content:
+                lines.append(f"   Snippet: {content[:350]}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Failed technical search via Tavily: {str(e)}"
+
+
 # =============================================================================
 # CONSULTATION TOOL — Must be called first to discuss options with the user
 # =============================================================================
@@ -222,6 +283,11 @@ and pass them directly into tools like merge_audio_video or create_talking_avata
 FAL DOCS ENFORCEMENT:
 Before finalizing model choice or endpoint routing (especially after recent updates), call consult_fal_docs.
 Use docs findings to adapt the plan and avoid outdated/removed endpoints.
+
+TECHNICAL RESEARCH:
+If unsure about latest FFmpeg filter syntax, specific Fal.ai model pricing/endpoints,
+or new multimedia trends, you MUST call search_multimedia_tech before formulating a plan.
+This keeps execute_raw_ffmpeg and other advanced operations up-to-date and valid.
 
 PICTURE-IN-PICTURE (PiP):
 If the user wants to overlay a talking avatar or a camera feed onto a background video
