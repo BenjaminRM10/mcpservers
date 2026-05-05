@@ -26,6 +26,21 @@ MEDIA_ARCHIVE_DIR = Path.home() / "Documents" / "ai-multimedia-files"
 FAL_DOCS_MCP_URL = "https://docs.fal.ai/mcp"
 
 
+def get_media_subdir(filename: str) -> str:
+    """Returns the organized subfolder name based on file extension."""
+    ext = Path(filename).suffix.lower()
+    if ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        return "video"
+    elif ext in {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}:
+        return "audio"
+    elif ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+        return "image"
+    elif ext in {".srt", ".vtt", ".ass", ".sub"}:
+        return "subtitles"
+    else:
+        return "other"
+
+
 def get_google_client():
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -65,45 +80,33 @@ async def ensure_public_url(path_or_url: str) -> str:
 
 def resolve_output_path(output_filename: str) -> Path:
     """
-    Resolves the primary output path.
+    Resolves the output path to the organized Documents archive folder.
     - Absolute paths are used as-is.
-    - Relative paths resolve to the current working directory.
+    - Relative paths are routed to ~/Documents/ai-multimedia-files/<type>/ based on extension.
     """
     p = Path(output_filename)
-    path = p if p.is_absolute() else Path.cwd() / p.name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path.resolve()
+    if p.is_absolute():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p.resolve()
+    subdir = get_media_subdir(p.name)
+    archive_subdir = MEDIA_ARCHIVE_DIR / subdir
+    archive_subdir.mkdir(parents=True, exist_ok=True)
+    return (archive_subdir / p.name).resolve()
 
 
 def copy_to_archive(output_path: Path) -> Path:
-    """
-    Copies the generated file to ~/Documents/ai-multimedia-files/ as a permanent backup.
-    Adds a numeric suffix if a file with the same name already exists.
-    """
-    MEDIA_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    archive_path = MEDIA_ARCHIVE_DIR / output_path.name
-    if archive_path.exists() and archive_path != output_path:
-        stem = archive_path.stem
-        suffix = archive_path.suffix
-        counter = 1
-        while archive_path.exists():
-            archive_path = MEDIA_ARCHIVE_DIR / f"{stem}_{counter}{suffix}"
-            counter += 1
-    if output_path != archive_path:
-        shutil.copy2(output_path, archive_path)
-    return archive_path
+    """File is already saved in the organized archive directory. No-op."""
+    return output_path
 
 
 def format_result(media_type: str, engine: str, local_path: str, public_url: str, archive_path: str = "") -> str:
-    """Standard return format with local path, public URL, and archive copy."""
+    """Standard return format with saved path and public URL."""
     lines = [
         f"Successfully generated {media_type} via {engine}.",
-        f"LOCAL_PATH: {local_path}",
+        f"SAVED_TO: {local_path}",
         f"PUBLIC_URL: {public_url}",
+        "Use PUBLIC_URL when passing this asset to other tools (e.g. create_talking_avatar, generate_video).",
     ]
-    if archive_path:
-        lines.append(f"ARCHIVE_COPY: {archive_path}")
-    lines.append("Use PUBLIC_URL when passing this asset to other tools (e.g. create_talking_avatar, generate_video).")
     return "\n".join(lines)
 
 
@@ -475,8 +478,8 @@ async def generate_subtitles_file(
         return (
             "SUBTITLES_GENERATED\n"
             f"FORMAT: {fmt}\n"
-            f"LOCAL_PATH: {output_path}\n"
-            "Use LOCAL_PATH with execute_raw_ffmpeg subtitles filter for burned-in captions."
+            f"SAVED_TO: {output_path}\n"
+            "Use SAVED_TO path with execute_raw_ffmpeg subtitles filter for burned-in captions."
         )
 
     except Exception as e:
@@ -683,7 +686,7 @@ QUESTIONS YOU MUST ASK THE USER:
 - Need reproducibility? (seed for exact same result)
 - Output format: PNG (lossless) or JPEG (compressed)?
 
-OUTPUT: Saves to current working directory AND backup copy to ~/Documents/ai-multimedia-files/
+OUTPUT: Saves directly to ~/Documents/ai-multimedia-files/image/ (organized by type).
 """
     elif media_type == "video":
         return f"""
@@ -782,23 +785,87 @@ QUESTIONS YOU MUST ASK THE USER:
 === TALKING AVATAR OPTIONS ===
 
 ENGINES (ask the user which one):
-1. "live-avatar" — Live Avatar (Fal.ai): Natural real-time expressions.
-2. "kling-avatar" — Kling AI Avatar v2 (Fal.ai): Studio-grade lipsync.
+1. "live-avatar" — Live Avatar (Fal.ai)
+   Price: ~$0.03/second of output video | Best for: Natural, expressive real-time avatar
+2. "kling-avatar" — Kling AI Avatar v2 (Fal.ai)
+   Price: ~$0.08/second of output video | Best for: Studio-grade lipsync, cinematic quality
 
-REQUIREMENTS:
-- image_url: Portrait image (PUBLIC_URL or local path — auto-uploaded if local)
-- audio_url: Speech audio (PUBLIC_URL or local path — auto-uploaded if local)
+COST CONFIRMATION RULE (mandatory for every avatar generation):
+- ALWAYS call create_talking_avatar first with confirm_cost=False to get the cost estimate.
+- Show the FULL estimate to the user and wait for explicit confirmation before proceeding.
+- Only then call again with confirm_cost=True and acknowledged_estimated_cost_usd.
 
-WORKFLOW — Explain to the user:
-1. Generate or provide a portrait image → use generate_image → get PUBLIC_URL
-2. Generate speech audio → use generate_audio(engine="tts") → get PUBLIC_URL
-3. Call create_talking_avatar with both PUBLIC_URLs (or local paths)
+WORKFLOW OPTIONS — Present these to the user:
+Option A — Avatar from user's own image (most common):
+  1. User provides portrait image (absolute local path or PUBLIC_URL)
+  2. generate_audio(engine="tts") → generate speech → get PUBLIC_URL
+  3. create_talking_avatar(image_url=..., audio_url=PUBLIC_URL, confirm_cost=False) → show estimate → confirm → generate
 
-QUESTIONS YOU MUST ASK THE USER:
-- Do they have a portrait image, or should we generate one?
-- What should the avatar say?
-- Which voice for the speech?
-- Which avatar engine? live-avatar (natural) or kling-avatar (studio quality)?
+Option B — Fully AI-generated avatar:
+  1. generate_image → portrait → get PUBLIC_URL
+  2. generate_audio(engine="tts") → speech → get PUBLIC_URL
+  3. create_talking_avatar(image_url=PUBLIC_URL, audio_url=PUBLIC_URL, confirm_cost=False) → confirm → generate
+
+Option C — Avatar on background (PiP):
+  Same as A or B, then use create_pip_video to overlay avatar video on a background image/video.
+
+QUESTIONS YOU MUST ASK THE USER — ALL of these, before starting:
+
+1. IMAGE SOURCE:
+   "Do you have a portrait photo to use, or should I generate one with AI?"
+   - If user has one: ask for the absolute file path (e.g. /home/user/foto.jpg)
+   - If generating: ask for style (photorealistic, cartoon, illustration?), aspect ratio (1:1 recommended for portraits)
+
+2. SCRIPT / TEXT:
+   "What should the avatar say? Please give me the full text."
+   (Get the complete script — no assumptions)
+
+3. VOICE SELECTION:
+   "Which voice do you want? Here are the options:"
+   Female voices:
+     - Aria: warm, conversational (American/Latina friendly)
+     - Sarah: clear, professional
+     - Laura: expressive, dramatic
+     - Charlotte: elegant, refined
+     - Jessica: energetic, upbeat
+     - Lily: soft, gentle
+     - Bella: soft, excellent for LatAm Spanish
+   Male voices:
+     - Roger: confident, authoritative
+     - Charlie: casual, friendly
+     - George: deep, mature
+     - Liam: young, dynamic
+     - Daniel: calm, neutral
+     - Chris: warm, natural
+     - Adam: deep, excellent for LatAm Spanish
+
+4. VOICE STYLE PARAMETERS:
+   - Speed: "Do you want a normal pace (1.0), slower/dramatic (0.7-0.9), or faster/energetic (1.1-1.2)?"
+   - Expressiveness: "More expressive and variable delivery, or more stable/consistent?"
+     (Low stability ~0.2 = very expressive | High stability ~0.8 = very consistent)
+   - Language: "Should I auto-detect the language, or force a specific one? (es=Spanish, en=English, pt=Portuguese)"
+
+5. AVATAR ENGINE:
+   "Which engine do you prefer?"
+   - live-avatar: natural expressions, ~$0.03/sec
+   - kling-avatar: studio-grade lipsync, more cinematic, ~$0.08/sec
+
+6. BACKGROUND:
+   "Do you want a background behind the avatar?"
+   - No → use avatar video as-is
+   - Yes, image → use create_pip_video after generation (ask for background image path)
+   - Yes, video → use create_pip_video after generation (ask for background video path)
+
+7. SUBTITLES:
+   "Do you want subtitles burned into the video?"
+   - Yes → after avatar: generate_subtitles_file → burn_subtitles_pro
+   - Style options: tiktok, mrbeast, clean
+
+8. CONFIRM BEFORE EACH GENERATION STEP:
+   - Before audio: show TTS cost (~$0.01) and confirm
+   - Before avatar: always use confirm_cost=False first, show estimate, wait for "yes, proceed"
+
+OUTPUT: Files saved to ~/Documents/ai-multimedia-files/ organized by type (video/, audio/, image/, subtitles/).
 """
     return "Invalid media type. Choose: image, video, audio, or avatar."
 
@@ -1655,16 +1722,18 @@ async def create_talking_avatar(
     audio_url: str,
     output_filename: str,
     engine: Literal["live-avatar", "kling-avatar"] = "live-avatar",
+    confirm_cost: bool = False,
+    acknowledged_estimated_cost_usd: Optional[float] = None,
     ctx: Context = None
 ) -> str:
     """
-    Generates a talking avatar (lipsync) from image + audio. Returns LOCAL_PATH, PUBLIC_URL, and ARCHIVE_COPY.
+    Generates a talking avatar (lipsync) from image + audio. Returns SAVED_TO and PUBLIC_URL.
 
     Call consult_multimedia_options("avatar") first to discuss the workflow with the user.
 
     Engines:
-    - live-avatar: Natural real-time expressions.
-    - kling-avatar: Kling AI Avatar v2, studio-grade lipsync.
+    - live-avatar: Natural real-time expressions. ~$0.03/sec of output video.
+    - kling-avatar: Kling AI Avatar v2, studio-grade lipsync. ~$0.08/sec of output video.
 
     image_url and audio_url accept EITHER:
     - A PUBLIC_URL (https://...) from generate_image / generate_audio output
@@ -1673,11 +1742,59 @@ async def create_talking_avatar(
     Recommended workflow:
     1. generate_image → get PUBLIC_URL for portrait
     2. generate_audio(engine="tts") → get PUBLIC_URL for speech
-    3. create_talking_avatar(image_url=PUBLIC_URL, audio_url=PUBLIC_URL)
+    3. create_talking_avatar(confirm_cost=False) → show estimate to user → confirm
+    4. create_talking_avatar(confirm_cost=True, acknowledged_estimated_cost_usd=...) → generate
+
+    COST SAFETY (mandatory):
+    - First call MUST use confirm_cost=False (default). Returns estimate and stops.
+    - Show the estimate to the user and ask for explicit confirmation.
+    - Second call must set confirm_cost=True and pass acknowledged_estimated_cost_usd.
     """
     try:
         check_fal_key()
         output_path = resolve_output_path(output_filename)
+
+        # Estimate cost based on audio duration (use ffprobe for local files)
+        estimated_duration_s = 15.0  # conservative default
+        audio_is_local = not audio_url.startswith(("https://", "http://", "data:"))
+        if audio_is_local:
+            try:
+                probe = subprocess.run(
+                    [
+                        "ffprobe", "-v", "quiet",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        str(Path(audio_url).resolve()),
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if probe.returncode == 0 and probe.stdout.strip():
+                    estimated_duration_s = float(probe.stdout.strip())
+            except Exception:
+                pass
+
+        price_per_sec = 0.03 if engine == "live-avatar" else 0.08
+        estimated_cost_usd = round(price_per_sec * estimated_duration_s, 2)
+
+        if not confirm_cost:
+            duration_note = f"~{estimated_duration_s:.1f}s" if audio_is_local else f"~{estimated_duration_s:.1f}s (estimated — local audio not provided)"
+            return (
+                "COST_ESTIMATE_REQUIRED\n"
+                f"engine={engine}\n"
+                f"estimated_duration={duration_note}\n"
+                f"price_per_sec=${price_per_sec:.2f}\n"
+                f"estimated_cost_usd=${estimated_cost_usd:.2f}\n\n"
+                "Show this estimate to the user and wait for explicit confirmation before proceeding.\n"
+                "Then call create_talking_avatar again with confirm_cost=True and "
+                "acknowledged_estimated_cost_usd set to this exact value."
+            )
+
+        if acknowledged_estimated_cost_usd is None:
+            return (
+                "CONFIRMATION_MISSING\n"
+                "You set confirm_cost=True but did not provide acknowledged_estimated_cost_usd. "
+                "Pass the estimate returned by the preflight call."
+            )
 
         if ctx:
             await ctx.info("Resolving image and audio URLs...")
@@ -1692,14 +1809,15 @@ async def create_talking_avatar(
             return "Invalid avatar engine."
 
         if ctx:
-            await ctx.info(f"Generating talking avatar with '{model}'... This may take 60-180 seconds.")
+            cost_hint = f" (confirmed estimate: ~${acknowledged_estimated_cost_usd:.2f})"
+            await ctx.info(f"Generating talking avatar with '{model}'{cost_hint}... This may take 60-300 seconds.")
             await ctx.report_progress(progress=0.1, total=1.0)
 
         result = await fal_client.subscribe_async(
             model,
             arguments={"image_url": image_url, "audio_url": audio_url},
             with_logs=True,
-            client_timeout=300.0
+            client_timeout=900.0,
         )
 
         if ctx:
@@ -1713,6 +1831,14 @@ async def create_talking_avatar(
         return f"Unexpected response: {str(result)}"
 
     except Exception as e:
+        err = str(e)
+        if "timed out" in err.lower():
+            return (
+                f"Failed to create talking avatar: {err}\n"
+                "NOTE: The provider may still be processing your request and could be charging credits. "
+                "Wait a few minutes before retrying to avoid double charges. "
+                "If a request_id appears above, save it for support/recredit."
+            )
         return f"Failed to create talking avatar: {str(e)}"
 
 
