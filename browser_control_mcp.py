@@ -16,10 +16,21 @@ mcp = FastMCP("browser-control")
 
 DEFAULT_TIMEOUT_MS = 15_000
 DEFAULT_SETTLE_MS = 500
+MAX_VISIBLE_SESSIONS = 4
+DEFAULT_DISPLAY_WIDTH = int(os.getenv("BROWSER_CONTROL_DISPLAY_WIDTH", "1920"))
+DEFAULT_DISPLAY_HEIGHT = int(os.getenv("BROWSER_CONTROL_DISPLAY_HEIGHT", "1080"))
+DEFAULT_BROWSER_CHANNEL = "chromium"
+DEFAULT_VIEWPORT = {"width": 1440, "height": 1000}
+VIEWPORT_PRESETS = {
+    "desktop": DEFAULT_VIEWPORT,
+    "tablet": {"width": 820, "height": 1180},
+    "mobile": {"width": 390, "height": 844},
+}
 
 _playwright: Any = None
 _browser: Any = None
 _browser_headless: Optional[bool] = None
+_browser_channel: Optional[str] = None
 _sessions: dict[str, "BrowserSession"] = {}
 _global_lock = asyncio.Lock()
 _MAX_LOG_EVENTS = 1_000
@@ -40,6 +51,7 @@ BROWSER_CONTROL_CAPABILITIES = {
         "browser_create_session",
         "browser_list_sessions",
         "browser_status",
+        "browser_display_options",
         "browser_close_session",
         "browser_close_all",
     ],
@@ -51,6 +63,7 @@ BROWSER_CONTROL_CAPABILITIES = {
         "browser_wait_for_text",
         "browser_wait_for_selector",
         "browser_wait_for_url",
+        "browser_get_dialog_content",
     ],
     "core_actions": [
         "browser_click_semantic",
@@ -88,7 +101,30 @@ BROWSER_CONTROL_CAPABILITIES = {
         "Use visual checkpoints plus view_image for human-visible layout claims.",
         "Check issue summary when behavior is broken or suspicious.",
         "Use one session_id per role/user when testing multi-role flows.",
+        "Headless is recommended. Visible browser sessions are limited to 4 and are tiled on the display.",
+        "Pass output_dir to screenshots/checkpoints to store report evidence directly in the workspace.",
     ],
+    "browser_visibility": {
+        "recommended": "headless",
+        "options": {
+            "headless": "Runs in the background; fastest and best for server QA.",
+            "visible": "Shows Chromium windows for human observation or captcha/MFA handoff; requires GUI/VNC/display; max 4 sessions.",
+        },
+    },
+    "browser_channels": {
+        "recommended": "chromium",
+        "options": {
+            "chromium": "Default Playwright Chromium; most portable for server/CI/functional QA.",
+            "chrome": "Real Google Chrome; use for visible or visual/responsive QA when installed.",
+        },
+    },
+    "viewport_presets": {
+        "desktop": VIEWPORT_PRESETS["desktop"],
+        "tablet": VIEWPORT_PRESETS["tablet"],
+        "mobile": VIEWPORT_PRESETS["mobile"],
+        "tile": "Match the visible tile size; useful for visible browser sessions.",
+        "custom": "Use viewport_width and viewport_height.",
+    },
 }
 
 
@@ -96,9 +132,14 @@ BROWSER_CONTROL_CAPABILITIES = {
 class BrowserSession:
     session_id: str
     role: str
+    browser: Any
     context: Any
     page: Any
     created_at: str
+    headless: bool = True
+    display_bounds: Optional[dict[str, int]] = None
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL
+    viewport: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_VIEWPORT))
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     console_logs: list[dict[str, Any]] = field(default_factory=list)
     page_errors: list[dict[str, Any]] = field(default_factory=list)
@@ -221,16 +262,66 @@ def _filter_events(
     return filtered[-limit:]
 
 
-async def _ensure_browser(headless: bool = True) -> Any:
-    global _playwright, _browser, _browser_headless
-
-    if _browser:
-        return _browser
-
+async def _ensure_playwright() -> Any:
+    global _playwright
     from playwright.async_api import async_playwright
 
-    _playwright = await async_playwright().start()
-    _browser = await _playwright.chromium.launch(
+    if not _playwright:
+        _playwright = await async_playwright().start()
+    return _playwright
+
+
+def _normalize_browser_channel(browser_channel: Optional[str]) -> str:
+    return (browser_channel or DEFAULT_BROWSER_CHANNEL).strip().lower()
+
+
+async def _launch_browser(browser_channel: str, headless: bool, args: list[str]) -> Any:
+    playwright = await _ensure_playwright()
+    launch_kwargs: dict[str, Any] = {"headless": headless, "args": args}
+    if browser_channel != DEFAULT_BROWSER_CHANNEL:
+        launch_kwargs["channel"] = browser_channel
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:
+        if browser_channel != DEFAULT_BROWSER_CHANNEL:
+            raise RuntimeError(
+                f"Could not launch browser_channel='{browser_channel}'. "
+                "Make sure that browser is installed, or use browser_channel='chromium'. "
+                f"Original error: {exc}"
+            ) from exc
+        raise
+
+
+def _resolve_viewport(
+    viewport_preset: Optional[str],
+    viewport_width: Optional[int],
+    viewport_height: Optional[int],
+    display_bounds: Optional[dict[str, int]],
+    headless: bool,
+) -> dict[str, int]:
+    preset = (viewport_preset or ("desktop" if headless else "tile")).strip().lower()
+    if preset == "custom":
+        if not viewport_width or not viewport_height:
+            raise ValueError("viewport_preset='custom' requires viewport_width and viewport_height.")
+        return {"width": int(viewport_width), "height": int(viewport_height)}
+    if preset == "tile":
+        if display_bounds:
+            return {"width": int(display_bounds["width"]), "height": int(display_bounds["height"])}
+        return dict(DEFAULT_VIEWPORT)
+    if preset in VIEWPORT_PRESETS:
+        return dict(VIEWPORT_PRESETS[preset])
+    raise ValueError("viewport_preset must be one of: desktop, tablet, mobile, tile, custom.")
+
+
+async def _ensure_browser(headless: bool = True, browser_channel: str = DEFAULT_BROWSER_CHANNEL) -> Any:
+    global _browser, _browser_headless, _browser_channel
+
+    browser_channel = _normalize_browser_channel(browser_channel)
+    if _browser and _browser_channel == browser_channel and _browser_headless == headless:
+        return _browser
+
+    _browser = await _launch_browser(
+        browser_channel,
         headless=headless,
         args=[
             "--no-sandbox",
@@ -238,16 +329,115 @@ async def _ensure_browser(headless: bool = True) -> Any:
         ],
     )
     _browser_headless = headless
+    _browser_channel = browser_channel
     return _browser
 
 
-async def _create_session(session_id: str, role: Optional[str] = None, headless: bool = True) -> BrowserSession:
+def _visible_sessions() -> list[BrowserSession]:
+    return [
+        session
+        for session in _sessions.values()
+        if not session.headless and session.page and not session.page.is_closed()
+    ]
+
+
+def _layout_bounds(count: int, index: int) -> dict[str, int]:
+    if count <= 1:
+        return {"x": 0, "y": 0, "width": DEFAULT_DISPLAY_WIDTH, "height": DEFAULT_DISPLAY_HEIGHT}
+    if count == 2:
+        width = DEFAULT_DISPLAY_WIDTH // 2
+        return {"x": index * width, "y": 0, "width": width, "height": DEFAULT_DISPLAY_HEIGHT}
+
+    width = DEFAULT_DISPLAY_WIDTH // 2
+    height = DEFAULT_DISPLAY_HEIGHT // 2
+    return {
+        "x": (index % 2) * width,
+        "y": (index // 2) * height,
+        "width": width,
+        "height": height,
+    }
+
+
+async def _set_window_bounds(session: BrowserSession, bounds: dict[str, int]) -> None:
+    if session.headless:
+        return
+    session.display_bounds = bounds
+    try:
+        cdp = await session.context.new_cdp_session(session.page)
+        window = await cdp.send("Browser.getWindowForTarget")
+        await cdp.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window["windowId"],
+                "bounds": {
+                    "left": bounds["x"],
+                    "top": bounds["y"],
+                    "width": bounds["width"],
+                    "height": bounds["height"],
+                    "windowState": "normal",
+                },
+            },
+        )
+    except Exception:
+        # Some servers do not expose a real window manager. The session still works.
+        pass
+
+
+async def _tile_visible_sessions() -> None:
+    sessions = _visible_sessions()
+    count = min(len(sessions), MAX_VISIBLE_SESSIONS)
+    for index, session in enumerate(sessions[:count]):
+        await _set_window_bounds(session, _layout_bounds(count, index))
+
+
+async def _create_session(
+    session_id: str,
+    role: Optional[str] = None,
+    headless: bool = True,
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
+    viewport_preset: Optional[str] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
+) -> BrowserSession:
     if session_id in _sessions:
         return _sessions[session_id]
 
-    browser = await _ensure_browser(headless=headless)
+    browser_channel = _normalize_browser_channel(browser_channel)
+    if not headless and len(_visible_sessions()) >= MAX_VISIBLE_SESSIONS:
+        raise RuntimeError("Visible browser sessions are limited to 4. Close a visible session or use headless mode.")
+
+    if headless and browser_channel == DEFAULT_BROWSER_CHANNEL:
+        browser = await _ensure_browser(headless=True, browser_channel=browser_channel)
+        launch_bounds = None
+    else:
+        launch_bounds = None
+        if not headless:
+            launch_bounds = _layout_bounds(
+                min(len(_visible_sessions()) + 1, MAX_VISIBLE_SESSIONS),
+                len(_visible_sessions()),
+            )
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        if launch_bounds:
+            launch_args.extend(
+                [
+                    f"--window-size={launch_bounds['width']},{launch_bounds['height']}",
+                    f"--window-position={launch_bounds['x']},{launch_bounds['y']}",
+                ]
+            )
+        browser = await _launch_browser(
+            browser_channel,
+            headless=headless,
+            args=[
+                *launch_args,
+            ],
+        )
+
+    viewport = _resolve_viewport(viewport_preset, viewport_width, viewport_height, launch_bounds, headless)
     context = await browser.new_context(
-        viewport={"width": 1440, "height": 1000},
+        viewport=viewport,
         locale="en-US",
         timezone_id=os.getenv("TZ", "America/Monterrey"),
     )
@@ -256,12 +446,19 @@ async def _create_session(session_id: str, role: Optional[str] = None, headless:
     session = BrowserSession(
         session_id=session_id,
         role=role or session_id,
+        browser=browser,
         context=context,
         page=page,
         created_at=_now_iso(),
+        headless=headless,
+        display_bounds=launch_bounds,
+        browser_channel=browser_channel,
+        viewport=viewport,
     )
     _install_page_observers(page, session)
     _sessions[session_id] = session
+    if not headless:
+        await _tile_visible_sessions()
     return session
 
 
@@ -269,6 +466,10 @@ async def _ensure_session(
     session_id: str = DEFAULT_SESSION_ID,
     role: Optional[str] = None,
     headless: bool = True,
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
+    viewport_preset: Optional[str] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
 ) -> BrowserSession:
     async with _global_lock:
         session = _sessions.get(session_id)
@@ -276,7 +477,15 @@ async def _ensure_session(
             return session
         if session:
             _sessions.pop(session_id, None)
-        return await _create_session(session_id=session_id, role=role, headless=headless)
+        return await _create_session(
+            session_id=session_id,
+            role=role,
+            headless=headless,
+            browser_channel=browser_channel,
+            viewport_preset=viewport_preset,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
 
 
 async def _current_session(session_id: str = DEFAULT_SESSION_ID) -> BrowserSession:
@@ -495,10 +704,107 @@ async def _compact_state(session: BrowserSession, text_chars: int = 1_000, max_e
         "role": session.role,
         "url": page.url,
         "title": await page.title(),
+        "browser_channel": session.browser_channel,
+        "viewport": session.viewport,
         "text_preview": text,
         "top_interactive_elements": elements,
         "issue_counts": _issue_counts(session),
     }
+
+
+async def _get_dialog_content(page: Any, max_text_chars: int = 3_000, max_elements: int = 30) -> dict[str, Any]:
+    dialogs = await page.locator(
+        "[role='dialog'],[role='alertdialog'],[aria-modal='true'],"
+        "[data-radix-popper-content-wrapper],[role='listbox'],[role='menu']"
+    ).evaluate_all(
+        """(nodes, args) => nodes.map((node, index) => {
+            const rect = node.getBoundingClientRect();
+            const text = (node.innerText || node.textContent || '').trim().replace(/\\s+/g, ' ');
+            const elements = Array.from(node.querySelectorAll(
+                "a,button,input,textarea,select,[role=button],[role=option],[role=menuitem],[contenteditable=true]"
+            )).slice(0, args.maxElements).map((el, elementIndex) => {
+                const elRect = el.getBoundingClientRect();
+                const label = (
+                    el.getAttribute('aria-label') ||
+                    el.getAttribute('placeholder') ||
+                    el.innerText ||
+                    el.value ||
+                    el.textContent ||
+                    ''
+                ).trim().replace(/\\s+/g, ' ').slice(0, 140);
+                return {
+                    index: elementIndex,
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role'),
+                    type: el.getAttribute('type'),
+                    name: el.getAttribute('name'),
+                    id: el.id,
+                    label,
+                    visible: !!(elRect.width || elRect.height),
+                    box: {
+                        x: Math.round(elRect.x),
+                        y: Math.round(elRect.y),
+                        width: Math.round(elRect.width),
+                        height: Math.round(elRect.height)
+                    }
+                };
+            });
+            return {
+                index,
+                tag: node.tagName.toLowerCase(),
+                role: node.getAttribute('role'),
+                aria_modal: node.getAttribute('aria-modal'),
+                visible: !!(rect.width || rect.height),
+                box: {
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
+                },
+                text: text.length > args.maxTextChars ? text.slice(0, args.maxTextChars) + "\\n...[truncated]" : text,
+                interactive_elements: elements
+            };
+        })""",
+        {"maxTextChars": max_text_chars, "maxElements": max_elements},
+    )
+    return {"count": len(dialogs), "dialogs": dialogs}
+
+
+async def _fill_locator_value(locator: Any, value: str, clear: bool = True) -> str:
+    """
+    Fill fields in a way React/Vue/Svelte observe. Playwright fill is best first;
+    native setter + input/change events repairs controlled inputs that ignore fill.
+    """
+    if clear:
+        await locator.fill(value)
+    else:
+        await locator.type(value)
+        return "type"
+
+    try:
+        await locator.evaluate(
+            """(el, value) => {
+                const proto = el instanceof HTMLTextAreaElement
+                    ? HTMLTextAreaElement.prototype
+                    : el instanceof HTMLInputElement
+                        ? HTMLInputElement.prototype
+                        : null;
+                const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+                if (descriptor && descriptor.set) {
+                    descriptor.set.call(el, value);
+                } else if ('value' in el) {
+                    el.value = value;
+                } else {
+                    el.textContent = value;
+                }
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            value,
+        )
+        return "fill+native-setter"
+    except Exception:
+        return "fill"
 
 
 async def _action_result(
@@ -515,6 +821,8 @@ async def _action_result(
         "role": session.role,
         "url": page.url,
         "title": await page.title(),
+        "browser_channel": session.browser_channel,
+        "viewport": session.viewport,
         "ready": ready,
         "issue_counts": _issue_counts(session),
     }
@@ -574,6 +882,8 @@ async def _snapshot(session: BrowserSession, max_text_chars: int = 8_000, max_el
         "role": session.role,
         "url": url,
         "title": title,
+        "browser_channel": session.browser_channel,
+        "viewport": session.viewport,
         "text": text,
         "interactive_elements": elements,
         "issue_counts": _issue_counts(session),
@@ -605,6 +915,27 @@ async def _screenshot_metadata(page: Any, path: Path, full_page: bool) -> dict[s
     }
 
 
+def _safe_file_stem(value: str, fallback: str = "screenshot") -> str:
+    stem = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value).strip("_")
+    return (stem or fallback)[:80]
+
+
+def _screenshot_path(prefix: str, output_dir: Optional[str], filename: Optional[str]) -> Path:
+    safe_prefix = _safe_file_stem(prefix, fallback="browser_control")
+    if output_dir:
+        directory = Path(output_dir).expanduser()
+        directory.mkdir(parents=True, exist_ok=True)
+        if filename:
+            safe_name = _safe_file_stem(Path(filename).stem, fallback=safe_prefix)
+            return directory / f"{safe_name}.png"
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        return directory / f"{safe_prefix}-{timestamp}.png"
+
+    fd, raw_path = tempfile.mkstemp(prefix=f"{safe_prefix}_", suffix=".png")
+    os.close(fd)
+    return Path(raw_path)
+
+
 @mcp.tool()
 async def browser_capabilities() -> str:
     """
@@ -614,16 +945,61 @@ async def browser_capabilities() -> str:
 
 
 @mcp.tool()
+async def browser_display_options() -> str:
+    """
+    Return display/headless options and current visible-session layout limits.
+    """
+    return _json(
+        {
+            "ok": True,
+            "recommended": "headless",
+            "options": BROWSER_CONTROL_CAPABILITIES["browser_visibility"]["options"],
+            "browser_channels": BROWSER_CONTROL_CAPABILITIES["browser_channels"],
+            "viewport_presets": BROWSER_CONTROL_CAPABILITIES["viewport_presets"],
+            "visible_session_limit": MAX_VISIBLE_SESSIONS,
+            "visible_session_count": len(_visible_sessions()),
+            "display_size": {"width": DEFAULT_DISPLAY_WIDTH, "height": DEFAULT_DISPLAY_HEIGHT},
+            "visible_sessions": [
+                {
+                    "session_id": session.session_id,
+                    "role": session.role,
+                    "display_bounds": session.display_bounds,
+                    "viewport": session.viewport,
+                    "browser_channel": session.browser_channel,
+                    "url": session.page.url if session.page and not session.page.is_closed() else None,
+                }
+                for session in _visible_sessions()
+            ],
+        }
+    )
+
+
+@mcp.tool()
 async def browser_create_session(
     session_id: str,
     role: Optional[str] = None,
     headless: bool = True,
+    visual_mode: Optional[Literal["headless", "visible"]] = None,
+    browser_channel: Literal["chromium", "chrome", "chrome-beta", "msedge"] = DEFAULT_BROWSER_CHANNEL,
+    viewport_preset: Optional[Literal["desktop", "tablet", "mobile", "tile", "custom"]] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
 ) -> str:
     """
     Create an isolated browser session with its own cookies, localStorage, page, and logs.
     """
     try:
-        session = await _ensure_session(session_id=session_id, role=role, headless=headless)
+        if visual_mode:
+            headless = visual_mode == "headless"
+        session = await _ensure_session(
+            session_id=session_id,
+            role=role,
+            headless=headless,
+            browser_channel=browser_channel,
+            viewport_preset=viewport_preset,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
         return _json(
             {
                 "ok": True,
@@ -631,6 +1007,11 @@ async def browser_create_session(
                 "role": session.role,
                 "created_at": session.created_at,
                 "url": session.page.url,
+                "headless": session.headless,
+                "visible": not session.headless,
+                "display_bounds": session.display_bounds,
+                "browser_channel": session.browser_channel,
+                "viewport": session.viewport,
                 "open_human_checkpoints": len(
                     [item for item in session.human_checkpoints if not item.get("resolved")]
                 ),
@@ -658,6 +1039,11 @@ async def browser_list_sessions() -> str:
                     "created_at": session.created_at,
                     "page_open": bool(session.page and not session.page.is_closed()),
                     "url": session.page.url if session.page and not session.page.is_closed() else None,
+                    "headless": session.headless,
+                    "visible": not session.headless,
+                    "display_bounds": session.display_bounds,
+                    "browser_channel": session.browser_channel,
+                    "viewport": session.viewport,
                     "issue_counts": _issue_counts(session),
                     "open_human_checkpoints": len(
                         [item for item in session.human_checkpoints if not item.get("resolved")]
@@ -683,6 +1069,9 @@ async def browser_status() -> str:
                 "playwright": str(playwright),
                 "browser_open": bool(_browser),
                 "browser_headless": _browser_headless,
+                "browser_channel": _browser_channel,
+                "visible_session_limit": MAX_VISIBLE_SESSIONS,
+                "visible_session_count": len(_visible_sessions()),
                 "recommended_flow": BROWSER_CONTROL_CAPABILITIES["recommended_flow"],
                 "fallback_escape_hatches": BROWSER_CONTROL_CAPABILITIES["fallback_escape_hatches"],
                 "sessions": [
@@ -692,6 +1081,11 @@ async def browser_status() -> str:
                         "created_at": session.created_at,
                         "page_open": bool(session.page and not session.page.is_closed()),
                         "current_url": session.page.url if session.page and not session.page.is_closed() else None,
+                        "headless": session.headless,
+                        "visible": not session.headless,
+                        "display_bounds": session.display_bounds,
+                        "browser_channel": session.browser_channel,
+                        "viewport": session.viewport,
                         "issue_counts": _issue_counts(session),
                         "open_human_checkpoints": len(
                             [item for item in session.human_checkpoints if not item.get("resolved")]
@@ -712,6 +1106,11 @@ async def browser_open_url(
     session_id: str = DEFAULT_SESSION_ID,
     role: Optional[str] = None,
     headless: bool = True,
+    visual_mode: Optional[Literal["headless", "visible"]] = None,
+    browser_channel: Literal["chromium", "chrome", "chrome-beta", "msedge"] = DEFAULT_BROWSER_CHANNEL,
+    viewport_preset: Optional[Literal["desktop", "tablet", "mobile", "tile", "custom"]] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
     wait_until: Literal["load", "domcontentloaded", "networkidle"] = "domcontentloaded",
     wait_for_networkidle: bool = False,
     require_body_text: bool = True,
@@ -719,10 +1118,20 @@ async def browser_open_url(
     include_snapshot: bool = True,
 ) -> str:
     """
-    Open a URL in Chromium and return a page snapshot.
+    Open a URL in a browser session and return a page snapshot.
     """
     try:
-        session = await _ensure_session(session_id=session_id, role=role, headless=headless)
+        if visual_mode:
+            headless = visual_mode == "headless"
+        session = await _ensure_session(
+            session_id=session_id,
+            role=role,
+            headless=headless,
+            browser_channel=browser_channel,
+            viewport_preset=viewport_preset,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
         async with session.lock:
             page = session.page
             await page.goto(url, wait_until=wait_until)
@@ -784,6 +1193,41 @@ async def browser_compact_state(
             if wait_before:
                 ready = await _wait_for_page_ready(page, settle_ms=settle_ms)
             return _json({"ok": True, "session_id": session.session_id, "role": session.role, "ready": ready, "state": await _compact_state(session, text_chars, max_elements)})
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc), "session_id": session_id})
+
+
+@mcp.tool()
+async def browser_get_dialog_content(
+    session_id: str = DEFAULT_SESSION_ID,
+    max_text_chars: int = 3_000,
+    max_elements: int = 30,
+    wait_before: bool = True,
+    settle_ms: int = DEFAULT_SETTLE_MS,
+) -> str:
+    """
+    Inspect open dialogs, Radix/shadcn popovers, listboxes, and menus.
+    Use when modals/comboboxes are active or semantic locators are ambiguous.
+    """
+    try:
+        session = await _current_session(session_id)
+        async with session.lock:
+            page = session.page
+            ready = None
+            if wait_before:
+                ready = await _wait_for_page_ready(page, require_body_text=False, settle_ms=settle_ms)
+            return _json(
+                {
+                    "ok": True,
+                    "session_id": session.session_id,
+                    "role": session.role,
+                    "url": page.url,
+                    "title": await page.title(),
+                    "ready": ready,
+                    "dialog_content": await _get_dialog_content(page, max_text_chars, max_elements),
+                    "issue_counts": _issue_counts(session),
+                }
+            )
     except Exception as exc:
         return _json({"ok": False, "error": str(exc), "session_id": session_id})
 
@@ -865,18 +1309,18 @@ async def browser_type(
             locator = page.locator(selector).first if selector else page.locator(
                 "input,textarea,[contenteditable=true]"
             ).nth(element_index or 0)
-            if clear:
-                await locator.fill(text)
-            else:
-                await locator.type(text)
+            fill_method = await _fill_locator_value(locator, text, clear=clear)
             observation = await _action_observation(session, before_url, before_title)
             return _json(
-                await _action_result(
-                    session,
-                    include_snapshot=include_snapshot,
-                    include_compact_state=include_compact_state,
-                    observation=observation,
-                )
+                {
+                    **await _action_result(
+                        session,
+                        include_snapshot=include_snapshot,
+                        include_compact_state=include_compact_state,
+                        observation=observation,
+                    ),
+                    "fill_method": fill_method,
+                }
             )
     except Exception as exc:
         return _json({"ok": False, "error": str(exc), "session_id": session_id})
@@ -1028,19 +1472,19 @@ async def browser_type_semantic(
                 role=role,
                 exact=exact,
             )
-            if clear:
-                await locator.fill(value)
-            else:
-                await locator.type(value)
+            fill_method = await _fill_locator_value(locator, value, clear=clear)
             if press_after:
                 await locator.press(press_after)
             return _json(
-                await _action_result(
-                    session,
-                    include_snapshot=include_snapshot,
-                    include_compact_state=include_compact_state,
-                    observation=await _action_observation(session, before_url, before_title),
-                )
+                {
+                    **await _action_result(
+                        session,
+                        include_snapshot=include_snapshot,
+                        include_compact_state=include_compact_state,
+                        observation=await _action_observation(session, before_url, before_title),
+                    ),
+                    "fill_method": fill_method,
+                }
             )
     except Exception as exc:
         return _json({"ok": False, "error": str(exc), "session_id": session_id})
@@ -1082,10 +1526,7 @@ async def browser_fill_form(
                     text=field.get("text"),
                     exact=bool(field.get("exact", False)),
                 )
-                if bool(field.get("clear", True)):
-                    await locator.fill(value)
-                else:
-                    await locator.type(value)
+                fill_method = await _fill_locator_value(locator, value, clear=bool(field.get("clear", True)))
                 if field.get("press_after"):
                     await locator.press(str(field["press_after"]))
                 results.append(
@@ -1097,6 +1538,7 @@ async def browser_fill_form(
                             if field.get(key)
                         },
                         "filled": True,
+                        "fill_method": fill_method,
                     }
                 )
             submitted = False
@@ -1162,15 +1604,59 @@ async def browser_select_option_semantic(
                 except Exception:
                     await locator.select_option(value=value)
             else:
-                await locator.fill(value)
+                try:
+                    await locator.click()
+                except Exception:
+                    await locator.evaluate("el => el.click()")
+                try:
+                    fill_method = await _fill_locator_value(locator, value, clear=True)
+                except Exception:
+                    fill_method = "click-only"
                 await page.wait_for_timeout(settle_ms)
                 option = option_text or value
                 try:
-                    await page.get_by_role("option", name=option, exact=exact).first.click(timeout=3_000)
-                    selected_by = "role-option"
+                    popup_option = page.locator(
+                        "[role='listbox'] [role='option'],"
+                        "[data-radix-popper-content-wrapper] [role='option'],"
+                        "[role='menu'] [role='menuitem'],"
+                        "[cmdk-item],"
+                        "[data-radix-popper-content-wrapper] *"
+                    ).filter(has_text=option).first
+                    await popup_option.click(timeout=3_000)
+                    selected_by = "popup-option"
                 except Exception:
-                    await page.get_by_text(option, exact=exact).first.click(timeout=3_000)
-                    selected_by = "text-option"
+                    try:
+                        await page.get_by_role("option", name=option, exact=exact).first.click(timeout=3_000)
+                        selected_by = "role-option"
+                    except Exception:
+                        try:
+                            await page.get_by_text(option, exact=exact).first.click(timeout=3_000)
+                            selected_by = "text-option"
+                        except Exception as option_exc:
+                            try:
+                                clicked = await page.evaluate(
+                                    """(optionText) => {
+                                        const containers = Array.from(document.querySelectorAll(
+                                            "[role='listbox'],[data-radix-popper-content-wrapper],[role='menu'],[cmdk-list]"
+                                        ));
+                                        for (const container of containers) {
+                                            const match = Array.from(container.querySelectorAll('*')).find((el) =>
+                                                (el.innerText || el.textContent || '').trim().includes(optionText)
+                                            );
+                                            if (match) {
+                                                match.click();
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }""",
+                                    option,
+                                )
+                                if not clicked:
+                                    raise option_exc
+                                selected_by = "popup-js-click"
+                            except Exception:
+                                raise option_exc
             ready = await _wait_for_page_ready(page, settle_ms=settle_ms)
             return _json(
                 {
@@ -1183,6 +1669,7 @@ async def browser_select_option_semantic(
                     "selected_by": selected_by,
                     "value": value,
                     "option_text": option_text,
+                    "fill_method": locals().get("fill_method"),
                 }
             )
     except Exception as exc:
@@ -1198,9 +1685,12 @@ async def browser_screenshot(
     wait_for_networkidle: bool = False,
     require_body_text: bool = True,
     settle_ms: int = 750,
+    output_dir: Optional[str] = None,
+    filename: Optional[str] = None,
 ) -> str:
     """
     Capture a screenshot. Returns a local file path by default.
+    Pass output_dir to store report evidence directly in the workspace.
     """
     try:
         session = await _current_session(session_id)
@@ -1214,9 +1704,7 @@ async def browser_screenshot(
                     require_body_text=require_body_text,
                     settle_ms=settle_ms,
                 )
-            fd, raw_path = tempfile.mkstemp(prefix="browser_control_", suffix=".png")
-            os.close(fd)
-            path = Path(raw_path)
+            path = _screenshot_path("browser_control", output_dir=output_dir, filename=filename)
             await page.screenshot(path=str(path), full_page=full_page)
             metadata = await _screenshot_metadata(page, path, full_page)
             result: dict[str, Any] = {"ok": True, "ready": ready, **metadata}
@@ -1235,6 +1723,8 @@ async def browser_visual_checkpoint(
     wait_for_networkidle: bool = False,
     require_body_text: bool = True,
     settle_ms: int = 1_000,
+    output_dir: Optional[str] = None,
+    filename: Optional[str] = None,
 ) -> str:
     """
     Capture a stabilized screenshot specifically for human-style visual QA.
@@ -1253,10 +1743,8 @@ async def browser_visual_checkpoint(
                 require_body_text=require_body_text,
                 settle_ms=settle_ms,
             )
-            safe_label = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)[:60]
-            fd, raw_path = tempfile.mkstemp(prefix=f"browser_control_{safe_label}_", suffix=".png")
-            os.close(fd)
-            path = Path(raw_path)
+            safe_label = _safe_file_stem(label, fallback="visual-checkpoint")
+            path = _screenshot_path(f"browser_control_{safe_label}", output_dir=output_dir, filename=filename)
             await page.screenshot(path=str(path), full_page=full_page)
             metadata = await _screenshot_metadata(page, path, full_page)
             return _json(
@@ -1612,6 +2100,9 @@ async def browser_close_session(session_id: str = DEFAULT_SESSION_ID) -> str:
         async with session.lock:
             if session.context:
                 await session.context.close()
+            if session.browser and session.browser is not _browser:
+                await session.browser.close()
+        await _tile_visible_sessions()
         return _json({"ok": True, "session_id": session_id, "role": session.role})
     except Exception as exc:
         return _json({"ok": False, "error": str(exc), "session_id": session_id})
@@ -1622,7 +2113,7 @@ async def browser_close_all() -> str:
     """
     Close all browser sessions and the shared Chromium process.
     """
-    global _playwright, _browser, _browser_headless
+    global _playwright, _browser, _browser_headless, _browser_channel
     async with _global_lock:
         try:
             closed = []
@@ -1630,6 +2121,8 @@ async def browser_close_all() -> str:
                 async with session.lock:
                     if session.context:
                         await session.context.close()
+                    if session.browser and session.browser is not _browser:
+                        await session.browser.close()
                     closed.append({"session_id": session_id, "role": session.role})
             _sessions.clear()
             if _browser:
@@ -1639,6 +2132,7 @@ async def browser_close_all() -> str:
             _playwright = None
             _browser = None
             _browser_headless = None
+            _browser_channel = None
             return _json({"ok": True, "closed": closed})
         except Exception as exc:
             return _json({"ok": False, "error": str(exc)})
